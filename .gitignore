@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Data files (large)
+*.npz
+*.wav
+*.aac
+*.flv
+*.mp4
+!motion-signature/real_fusion/**/*.mp4
+
+# System
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env
+*.pem
+*.p12
+
+# Output dirs
+results/
+real_fusion/sample2/segments/
+real_fusion/sample2/segments2/

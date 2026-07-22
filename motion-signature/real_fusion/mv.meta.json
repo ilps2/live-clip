@@ -1,0 +1,8 @@
+{
+  "width": 592,
+  "height": 1280,
+  "grid_w": 27,
+  "grid_h": 48,
+  "source": "直播带货样本.mp4",
+  "method": "pyav export_mvs (encoder MVs)"
+}
