@@ -159,6 +159,7 @@ def main():
     # ---- Sticker overlay (AI extraction or manual input) ----
     sticker_top = sticker_bot = None
     sticker_filter = ""
+    all_sticker_variants = {}
     crop_filter = ""
     if args.sticker_overlay and has_mv and orient == "vertical":
         # 1. Detect overlay region from MV motion heatmap
@@ -169,84 +170,122 @@ def main():
         print(f"  Sticker bars: top {tfrac*100:.0f}% ({bar_h_top}px), bot {(1-bfrac)*100:.0f}% ({bar_h_bot}px)")
 
         # 2. Determine sticker text: manual input or AI extraction
+        all_sticker_sets = {}
         if args.sticker_lines:
             # Manual mode: comma-separated "top_brand|top_price|bot_line1|bot_line2|..."
             parts = args.sticker_lines.split("|")
             top_lines = parts[:2] if len(parts) >= 2 else [parts[0], ""]
             bot_lines = parts[2:] if len(parts) > 2 else []
+            all_sticker_sets["manual"] = (top_lines, bot_lines)
             mode = "manual"
         else:
-            # AI extraction mode: keyword matching from ASR
+            # AI extraction mode: audience-segmented keyword matching
             from collections import Counter
-            kw_counter = Counter()
-            kw_map = {
-                "品牌": ["品牌","我们家","原创","自营"],
-                "功效": ["抗皱","紧致","淡纹","提亮","保湿","控油","修复","美白","防晒","遮瑕","持妆"],
-                "卖点": ["试用","包退","放心","加量","大容量","正装","送","赠","复购","回头"],
-                "价格": ["元","优惠","福利","限时","便宜"],
+            
+            # Audience segments — each has keyword sets for different sticker layers
+            AUDIENCE_SEGMENTS = {
+                "price": {
+                    "name": "价格敏感",
+                    "top_kw": ["划算","便宜","性价比","优惠","福利","限时","秒杀","补贴","赠品","送","平均才","不到"],
+                    "bot_kw": ["试用","包退","运费险","放心拍","售后","正品","保质期"],
+                },
+                "quality": {
+                    "name": "品质导向", 
+                    "top_kw": ["高级","质感","专柜","明星","贵妇","成分","精华","科技","专利","进口","限量"],
+                    "bot_kw": ["持妆","服帖","轻薄","养肤","不卡粉","细腻","光泽","哑光"],
+                },
+                "effect": {
+                    "name": "效果焦虑",
+                    "top_kw": ["遮瑕","显白","毛孔","痘印","斑点","暗沉","细纹","松弛","出油","脱妆"],
+                    "bot_kw": ["前后对比","肉眼可见","立竿见影","回购","复购","空瓶","自用"],
+                },
             }
-            for seg in segs:
-                for cat, kws in kw_map.items():
-                    for kw in kws:
+
+            # Score each segment against ASR in this video
+            segment_scores = {}
+            for seg_id, seg_data in AUDIENCE_SEGMENTS.items():
+                score = 0
+                for kw in seg_data["top_kw"] + seg_data["bot_kw"]:
+                    for s in segs:
+                        if kw in s["text"]:
+                            score += 1
+                segment_scores[seg_id] = score
+
+            # Pick top 3 matching segments (all three: price, quality, effect)
+            active_segments = sorted(segment_scores, key=segment_scores.get, reverse=True)[:3]
+            
+            # Generate sticker text per segment
+            for seg_id in active_segments:
+                seg = AUDIENCE_SEGMENTS[seg_id]
+                # Top lines: brand intro + segment-specific hook
+                top_hits = [kw for kw in seg["top_kw"] if any(kw in s["text"] for s in segs)]
+                bot_hits = [kw for kw in seg["bot_kw"] if any(kw in s["text"] for s in segs)]
+                
+                top_lines = [
+                    " · ".join(top_hits[:3]) if len(top_hits) >= 2 else (top_hits[0] if top_hits else "好物推荐"),
+                    f"「{seg['name']}」看这里",
+                ]
+                bot_lines = bot_hits[:4] if bot_hits else ["限时优惠"]
+                all_sticker_sets[seg_id] = (top_lines, bot_lines)
+            
+            # Fallback: if no segment matched, use top keywords
+            if not active_segments:
+                kw_counter = Counter()
+                for seg in segs:
+                    for kw in ["元","优惠","福利","限时","便宜","送","赠","试用","包退","遮瑕","持妆","保湿"]:
                         if kw in seg["text"]:
                             kw_counter[kw] += 1
-            top_kw = [w for w, _ in kw_counter.most_common(4)]
-            top_lines = [" · ".join(top_kw[:2]) if len(top_kw) >= 2 else (top_kw[0] if top_kw else "好物推荐"),
-                         "到手好价"]
-            bot_lines = [w for w in top_kw[2:]] if len(top_kw) > 2 else ["限时优惠"]
-            mode = "ai"
+                top_kw = [w for w, _ in kw_counter.most_common(3)]
+                all_sticker_sets["default"] = (
+                    [" · ".join(top_kw) if top_kw else "好物推荐", "到手好价"],
+                    ["限时优惠"]
+                )
 
-        print(f"  Sticker text ({mode}): top={top_lines}, bot={bot_lines}")
+            mode = f"audience-split ({len(active_segments)} segments: {', '.join(active_segments)})"
 
-        # 3. Render text PNGs with Swift CoreText
+        print(f"  Sticker text ({mode})")
+
+        # 3. Render all sticker variants (one per audience segment)
         t2p = str(BASE / "text2png_bin")
         if not Path(t2p).exists():
             subprocess.run(["swiftc", str(BASE / "text2png.swift"), "-o", t2p], check=True)
 
-        top_pngs = []
-        for i, line in enumerate(top_lines):
-            p = str(out_dir / f"_sticker_top_{i}.png")
-            subprocess.run([t2p, line, "32" if i == 0 else "36", p, "gold" if i == 0 else "white"], check=True)
-            top_pngs.append(p)
+        def composite_side(bar_h, pngs, out_path, y_start=30, y_step=80):
+            bar_path = str(out_dir / "_tmp_bar.png")
+            subprocess.check_call(
+                f"ffmpeg -y -v error -f lavfi -i color=c=black:s={w}x{bar_h}:d=0.1 "
+                f"-frames:v 1 -c:v png '{bar_path}'", shell=True)
+            prev = "0:v"; y = y_start
+            for idx, p in enumerate(pngs):
+                tmp = str(out_dir / f"_tmp_{idx}.png")
+                out_label = out_path if idx == len(pngs) - 1 else tmp
+                subprocess.check_call(
+                    f"ffmpeg -y -v error -i '{bar_path if idx == 0 else tmp_prev}' -i '{p}' "
+                    f'-filter_complex "[{prev}][1:v]overlay=(W-w)/2:{y}" '
+                    f"-c:v png '{out_label}'", shell=True)
+                if idx < len(pngs) - 1: tmp_prev = tmp
+                prev = "0:v"; y += y_step
 
-        bot_pngs = []
-        for i, line in enumerate(bot_lines):
-            p = str(out_dir / f"_sticker_bot_{i}.png")
-            subprocess.run([t2p, line, "30", p, "gold" if i == len(bot_lines) - 1 else "white"], check=True)
-            bot_pngs.append(p)
+        # Generate sticker sets for each audience segment
+        all_sticker_variants = {}  # {seg_id: (top_png_path, bot_png_path)}
+        for seg_id, (top_lines, bot_lines) in all_sticker_sets.items():
+            top_pngs = []
+            for i, line in enumerate(top_lines):
+                p = str(out_dir / f"_sticker_{seg_id}_top_{i}.png")
+                subprocess.run([t2p, line, "32" if i == 0 else "36", p, "gold" if i == 0 else "white"], check=True)
+                top_pngs.append(p)
+            bot_pngs = []
+            for i, line in enumerate(bot_lines):
+                p = str(out_dir / f"_sticker_{seg_id}_bot_{i}.png")
+                subprocess.run([t2p, line, "30", p, "gold" if i == len(bot_lines) - 1 else "white"], check=True)
+                bot_pngs.append(p)
 
-        # 4. Composite: black bars + text overlays
-        filter_parts = [f"[0:v]drawbox=y=0:h={bar_h_top}:color=black@1:t=fill,"
-                        f"drawbox=y=ih-{bar_h_bot}:h={bar_h_bot}:color=black@1:t=fill[bars]"]
-
-        inputs = ["-i", str(video)]
-        for p in top_pngs + bot_pngs:
-            inputs.extend(["-i", p])
-
-        prev = "bars"
-        vidx = 1
-        y_top = 60
-        for p in top_pngs:
-            next_label = f"t{vidx}"
-            filter_parts.append(f"[{prev}][{vidx}:v]overlay=(W-w)/2:{y_top}[{next_label}]")
-            prev = next_label
-            vidx += 1
-            y_top += 100
-
-        y_bot = h - bar_h_bot + 30
-        for p in bot_pngs:
-            next_label = f"b{vidx}"
-            filter_parts.append(f"[{prev}][{vidx}:v]overlay=(W-w)/2:{y_bot}[{next_label}]")
-            prev = next_label
-            vidx += 1
-            y_bot += 80
-
-        sticker_filter = ";".join(filter_parts)
-
-        # 5. Generate sticker overlay PNGs (for reuse across clips)
-        sticker_top = str(out_dir / "_sticker_top_final.png")
-        sticker_bot = str(out_dir / "_sticker_bot_final.png")
-        # We'll apply the full filter at clip time instead
+            sticker_top = str(out_dir / f"_sticker_{seg_id}_top_final.png")
+            sticker_bot = str(out_dir / f"_sticker_{seg_id}_bot_final.png")
+            composite_side(bar_h_top, top_pngs, sticker_top, y_start=40, y_step=100)
+            composite_side(bar_h_bot, bot_pngs, sticker_bot, y_start=30, y_step=80)
+            all_sticker_variants[seg_id] = (sticker_top, sticker_bot)
+            print(f"    {seg_id}: top={top_lines}, bot={bot_lines[:3]}")
 
     elif args.auto_crop and has_mv:
         from content_region import content_region
@@ -447,21 +486,31 @@ def main():
         nh = "✅" if has_name(s["t0"], s["t1"]) else "❌"
         print(f"  {i+1:3d} {s['t0']:5d}s {s['t1']:5d}s {s['t1']-s['t0']:4d}s {s['score']:6.2f} {ph:>6s} {nh:>5s}")
 
-    # ---- Cut + optional sticker overlay ----
+    # ---- Cut + optional sticker overlay (audience variants) ----
     for i, s in enumerate(selected):
-        out = out_dir / f"clip_{i+1:02d}_{s['t0']}-{s['t1']}s.mp4"
+        base_name = f"clip_{i+1:02d}_{s['t0']}-{s['t1']}s"
 
-        if args.sticker_overlay and sticker_filter:
-            # Build ffmpeg command with full filter_complex
-            cmd = ["ffmpeg", "-y", "-v", "error",
-                   "-ss", str(s["t0"]), "-to", str(s["t1"])]
-            cmd.extend(inputs)
-            cmd.extend(["-filter_complex", sticker_filter])
-            cmd.extend(["-map", f"[{prev}]", "-map", "0:a:0"])
-            cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                        "-c:a", "aac", "-b:a", "128k", str(out)])
-            subprocess.check_call(" ".join(f"'{a}'" if ' ' in a else a for a in cmd), shell=True)
-        else:
+        if args.sticker_overlay and all_sticker_variants:
+            # Output one clip per audience segment
+            for seg_id, (stop, sbot) in all_sticker_variants.items():
+                out = out_dir / f"{base_name}_{seg_id}.mp4"
+                subprocess.check_call(
+                    f"ffmpeg -y -v error -ss {s['t0']} -to {s['t1']} "
+                    f"-i '{video}' -i '{stop}' -i '{sbot}' "
+                    f'-filter_complex "[0:v][1:v]overlay=0:0[tmp];[tmp][2:v]overlay=0:{h - bar_h_bot}[outv]" '
+                    f'-map "[outv]" -map 0:a:0 '
+                    f"-c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k '{out}'",
+                    shell=True)
+        elif args.sticker_overlay and sticker_top and sticker_bot:
+            # Simple: overlay 2 pre-composited sticker PNGs onto video
+            subprocess.check_call(
+                f"ffmpeg -y -v error -ss {s['t0']} -to {s['t1']} "
+                f"-i '{video}' -i '{sticker_top}' -i '{sticker_bot}' "
+                f'-filter_complex "[0:v][1:v]overlay=0:0[tmp];[tmp][2:v]overlay=0:{h - bar_h_bot}[outv]" '
+                f'-map "[outv]" -map 0:a:0 '
+                f"-c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k '{out}'",
+                shell=True)
+        elif args.sticker_overlay:
             cmd = [
                 "ffmpeg", "-y", "-v", "error",
                 "-ss", str(s["t0"]), "-to", str(s["t1"]),
