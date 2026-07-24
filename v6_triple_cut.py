@@ -173,13 +173,26 @@ def main():
             continue
         
         size = out_path.stat().st_size / 1024
-        results.append(out_path)
+        results.append((out_path, c))
         print(f"  ✅ {name} ({dur:.0f}s, {size:.0f}KB) — {c['hook']}")
     
+    # Save copywriting sheet
+    copy_path = out_dir / "copywriting.txt"
+    target_names = {"price": "💰 价格敏感", "quality": "🔬 品质导向", "effect": "✨ 效果焦虑"}
+    with open(copy_path, "w") as f:
+        f.write(f"# {product} — {price}\n\n")
+        for out_path, c in results:
+            t = c["target"]
+            f.write(f"## {target_names.get(t, t)}\n")
+            f.write(f"文件: {out_path.name}\n")
+            f.write(f"时间: {c['start']:.0f}s - {c['end']:.0f}s\n")
+            f.write(f"Hook: {c['hook']}\n")
+            f.write(f"字幕建议: {c['hook']}\n\n")
+    
     print(f"\n{'=' * 60}")
-    print(f"完成: {len(results)} 条")
-    for r in results:
-        print(f"  {r.name}")
+    print(f"完成: {len(results)} 条 | 文案: {copy_path.name}")
+    for out_path, _ in results:
+        print(f"  {out_path.name}")
     print(f"输出: {out_dir}/")
     print(f"{'=' * 60}")
 

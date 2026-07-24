@@ -1,81 +1,73 @@
-# live-clip v2.0 — AI 粗剪 · 人工精修
+# live-clip v2.0 — AI 粗剪助手
 
-直播带货回放 → LLM 语义选段 → 三条人群定向切片。
+直播带货回放 → 定位精华片段 + 提取卖点文案。
 
-## 定位
+**定位：帮人工省掉「看 4 小时找内容」这一步。**
+产出三条人群定向粗剪 + 卖点文案，人工只需删多余部分、配字幕。
 
-**AI 做加法（多裁），人做减法（修剪）。**
-
-传统剪辑：看 4h 回放 → 找高光 → 精剪 → 4h/条
-本工具：扔视频 → 等 3min → 拿到 3 条粗剪 → 各删 5s 废话 → 3min/条
-
-## 三条人群切片
+## 做了什么
 
 ```
-16.7min 直播 → LLM 分析 ASR → 3 条切片
-
-💰 price 人群  | 补贴价 375，比599便宜  | 43s
-🔬 quality 人群 | 三张专利五张检测报告    | 42s  
-✨ effect 人群  | 抗老紧致补水全第一      | 43s
+4h 直播回放扔进去
+        ↓
+  ASR 转录（本地，免费）
+        ↓
+  LLM 语义分析：找到品名/价格/三类人群卖点的时间段
+        ↓
+  输出三样东西:
+    📍 时间戳 — 人工知道从哪开始看
+    📝 卖点文案 — 直接拿去配字幕
+    🎬 粗剪 MP4 — 人工删 5s 废话就发布
 ```
+
+## 三条人群定向切片
+
+```
+16.7min 直播 → LLM 分析 → 3 条
+
+💰 price 人群  | 补贴价 375，比599便宜    | 43s
+🔬 quality 人群 | 三张专利五张检测报告      | 42s  
+✨ effect 人群  | 抗老紧致补水全第一        | 43s
+```
+
+每条 = 品名 + 价格 + 一个定向卖点，三段不重叠，语音画面同源。
 
 ## 快速开始
 
 ```bash
-# 1. 安装依赖
+# 1. 装依赖
 pip install faster-whisper av numpy pandas
 
-# 2. ASR 转录（首次需下载模型）
+# 2. ASR 转录
 python livestream-highlight/asr.py \
   --video 直播回放.mp4 \
   --out transcript.jsonl \
   --model base
 
-# 3. AI 粗剪（需要 DeepSeek API key）
+# 3. AI 粗剪
 python v6_triple_cut.py \
   --video 直播回放.mp4 \
   --transcript transcript.jsonl \
-  --api-key sk-xxx \
-  --model deepseek-v4-pro
+  --api-key sk-xxx
 
-# 输出: 三条 MP4，拖进剪映各修 5s 即发
+# 输出: 3 条 MP4 + 卖点文案，人工修 5s 就发
 ```
-
-## 参数
-
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--min-dur` | 25 | 切片最短(秒) |
-| `--max-dur` | 55 | 切片最长(秒) |
-| `--padding` | 3 | 裁切边距(秒) |
-| `--model` | deepseek-v4-pro | LLM 模型 |
 
 ## 成本
 
-| 环节 | 单视频 | 50主播/天 |
+| 环节 | 单视频 | 50 主播/天 |
 |------|--------|-----------|
-| ASR (faster-whisper CPU) | ¥0 | ¥0 |
-| LLM (DeepSeek Pro) | ¥0.03 | ¥1.5 |
-| FFmpeg 裁切 | ¥0 | ¥0 |
+| ASR | ¥0 | ¥0 |
+| LLM | ¥0.03 | ¥1.5 |
 | **合计** | **¥0.03** | **¥1.5/天** |
 
-## 工作原理
+## 人工做什么
 
-```
-ASR 全文
-  ↓
-LLM 语义分析: 找到品名/价格/三类人群卖点的时间段
-  ↓
-FFmpeg 连续裁切: 语音画面同源，不拆不拼
-  ↓
-3 条独立切片: price / quality / effect 各一条
-  ↓
-人工精修: 各删 3-5s 开头结尾废话 → 发布
-```
+1. 看 3 条粗剪（3 × 40s = 2min）— 不需要看原片
+2. 删开头结尾多余寒暄（每条 3-5s）
+3. 配卖点文案当字幕 → 发布
 
-## 历史
+## 历史版本
 
-- v1.x: `cut_final.py` — MV 运动矢量 + 关键词规则匹配 + 贴纸
-- v2.0: `v6_triple_cut.py` — LLM 语义选段 + 人群定向
-
-v1.x 完整管线保留在 `cut_final.py`、`scene_classifier.py`、`motion-signature/` 中。
+- v1.x: `cut_final.py` — MV 运动矢量 + 规则匹配 + 人群贴纸
+- v2.0: `v6_triple_cut.py` — LLM 语义粗剪 + 人群定向
