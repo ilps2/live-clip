@@ -61,6 +61,8 @@ def build_prompt(transcript, max_chars=25000):
 每段必须包含: 品名介绍 + 价格提及 + 定向卖点
 每段30-50秒，从ASR中取连续时间。
 
+另外生成抖音发布文案。
+
 输出JSON:
 {{
   "product_name": "品名",
@@ -72,19 +74,13 @@ def build_prompt(transcript, max_chars=25000):
       "end": 秒数,
       "hook": "吸引该人群的一句话(≤15字)"
     }},
-    {{
-      "target": "quality",
-      "start": 秒数,
-      "end": 秒数,
-      "hook": "吸引该人群的一句话(≤15字)"
-    }},
-    {{
-      "target": "effect",
-      "start": 秒数,
-      "end": 秒数,
-      "hook": "吸引该人群的一句话(≤15字)"
-    }}
-  ]
+    ...
+  ],
+  "douyin": {{
+    "title": "视频标题(20字内，带emoji和感叹号)",
+    "hashtags": ["#标签1", "#标签2", "#标签3"],
+    "caption": "发布文案(100字内，分段，带emoji)"
+  }}
 }}
 
 ⚠️ 三个时间段不重叠，每个30-50秒。
@@ -134,10 +130,14 @@ def main():
     product = result.get("product_name", "未知")
     price = result.get("price", "?")
     clips = result.get("clips", [])
+    dy = result.get("douyin", {})
     
     print(f"  {product} — {price} | {len(clips)}条")
     for c in clips:
         print(f"    [{c['target']:7s}] {c['start']:.0f}-{c['end']:.0f}s | {c['hook']}")
+    if dy:
+        print(f"  📱 标题: {dy.get('title','')}")
+        print(f"  📱 话题: {' '.join(dy.get('hashtags',[]))}")
     
     if not clips:
         print("⚠️ 无切片"); return
@@ -179,15 +179,24 @@ def main():
     # Save copywriting sheet
     copy_path = out_dir / "copywriting.txt"
     target_names = {"price": "💰 价格敏感", "quality": "🔬 品质导向", "effect": "✨ 效果焦虑"}
+    
     with open(copy_path, "w") as f:
         f.write(f"# {product} — {price}\n\n")
+        
+        f.write("## 📱 抖音发布文案（复制即用）\n")
+        f.write(f"标题: {dy.get('title', '')}\n")
+        f.write(f"话题: {' '.join(dy.get('hashtags', []))}\n")
+        f.write(f"文案:\n{dy.get('caption', '')}\n\n")
+        f.write("---\n\n")
+        
+        f.write("## 🎬 三条切片\n\n")
         for out_path, c in results:
             t = c["target"]
-            f.write(f"## {target_names.get(t, t)}\n")
+            f.write(f"### {target_names.get(t, t)}\n")
             f.write(f"文件: {out_path.name}\n")
             f.write(f"时间: {c['start']:.0f}s - {c['end']:.0f}s\n")
             f.write(f"Hook: {c['hook']}\n")
-            f.write(f"字幕建议: {c['hook']}\n\n")
+            f.write(f"字幕: {c['hook']}\n\n")
     
     print(f"\n{'=' * 60}")
     print(f"完成: {len(results)} 条 | 文案: {copy_path.name}")
