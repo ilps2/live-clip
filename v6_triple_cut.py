@@ -99,6 +99,7 @@ def main():
     p.add_argument("--min-dur", type=int, default=25)
     p.add_argument("--max-dur", type=int, default=55)
     p.add_argument("--padding", type=int, default=3)
+    p.add_argument("--cover", action="store_true", help="生成 9:16 封面图")
     p.add_argument("--skip-llm", action="store_true")
     args = p.parse_args()
     
@@ -198,12 +199,88 @@ def main():
             f.write(f"Hook: {c['hook']}\n")
             f.write(f"字幕: {c['hook']}\n\n")
     
+    # Generate cover image
+    if args.cover and results:
+        cover_path = out_dir / "cover.jpg"
+        _gen_cover(args.video, results[0], product, price, cover_path)
+        print(f"  🖼️ 封面: {cover_path.name}")
+    
     print(f"\n{'=' * 60}")
     print(f"完成: {len(results)} 条 | 文案: {copy_path.name}")
     for out_path, _ in results:
         print(f"  {out_path.name}")
     print(f"输出: {out_dir}/")
     print(f"{'=' * 60}")
+
+
+def _gen_cover(video_path, first_clip, product, price, out_path):
+    """Generate 9:16 cover: video frame + product name + price + hook."""
+    from PIL import Image, ImageDraw, ImageFont
+    
+    out_path_obj, clip_data = first_clip
+    mid = (clip_data["start"] + clip_data["end"]) / 2
+    out_dir = Path(out_path).parent
+    
+    tmp_frame = str(out_dir / "_cover_tmp.jpg")
+    subprocess.run(
+        f"ffmpeg -y -v error -ss {mid} -i '{video_path}' -vframes 1 -q:v 2 '{tmp_frame}'",
+        shell=True, capture_output=True)
+    if not Path(tmp_frame).exists():
+        return
+    
+    img = Image.open(tmp_frame)
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    
+    bar_h = int(h * 0.20)
+    title = product[:14]
+    price_text = str(price)[:12]
+    hook = clip_data["hook"][:14]
+    
+    # Try to load a Chinese font
+    font_paths = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    ]
+    font_title = font_price = font_hook = None
+    for fp in font_paths:
+        try:
+            font_title = ImageFont.truetype(fp, 52)
+            font_price = ImageFont.truetype(fp, 38)
+            font_hook = ImageFont.truetype(fp, 44)
+            break
+        except:
+            continue
+    if not font_title:
+        font_title = font_price = font_hook = ImageFont.load_default()
+    
+    # Top bar: semi-transparent black + product name + price
+    top_box = [(0, 0), (w, bar_h)]
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rectangle(top_box, fill=(0, 0, 0, 140))
+    
+    # Title centered
+    bbox = draw.textbbox((0, 0), title, font=font_title)
+    tw = bbox[2] - bbox[0]
+    overlay_draw.text(((w - tw) / 2, int(bar_h * 0.08)), title, fill=(255, 255, 255, 255), font=font_title)
+    
+    # Price in gold
+    bbox = draw.textbbox((0, 0), price_text, font=font_price)
+    pw = bbox[2] - bbox[0]
+    overlay_draw.text(((w - pw) / 2, int(bar_h * 0.52)), price_text, fill=(255, 215, 0, 255), font=font_price)
+    
+    # Bottom bar: semi-transparent black + hook
+    bot_box = [(0, h - bar_h), (w, h)]
+    overlay_draw.rectangle(bot_box, fill=(0, 0, 0, 140))
+    bbox = draw.textbbox((0, 0), hook, font=font_hook)
+    hw = bbox[2] - bbox[0]
+    overlay_draw.text(((w - hw) / 2, h - bar_h + int(bar_h * 0.15)), hook, fill=(255, 255, 255, 255), font=font_hook)
+    
+    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    img.save(out_path, "JPEG", quality=92)
+    Path(tmp_frame).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
