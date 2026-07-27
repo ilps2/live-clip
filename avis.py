@@ -1136,6 +1136,102 @@ def export_clips(avis_dir: str, output_dir: str):
     print(f"Done: {len(mp4s)} files exported.")
 
 
+# ── Scout: search B站 for curatable videos ───────────────────────
+
+SCOUT_KEYWORDS = [
+    "开箱", "测评", "新品首发", "真实测评", "对比评测",
+    "发布会", "上手体验", "产品演示", "拆箱", "试用",
+    "unboxing", "review", "first look",
+]
+
+def scout_videos(keyword: str = None, count: int = 3, max_dur: int = 1800,
+                  output_dir: Path = None, asr_model: str = "tiny"):
+    """Search B站 for curation-worthy videos and auto-curate them.
+    
+    If keyword is None, cycles through SCOUT_KEYWORDS.
+    """
+    import urllib.request
+    import urllib.parse
+    import random
+    import time
+    
+    if output_dir is None:
+        output_dir = Path.cwd() / "avis_scouted"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Pick keyword
+    if keyword is None:
+        keyword = random.choice(SCOUT_KEYWORDS)
+    
+    print(f"🔍 Searching B站: \"{keyword}\" (max {max_dur//60}min)...")
+    
+    # B站 search API
+    search_url = (
+        f"https://api.bilibili.com/x/web-interface/wbi/search/type"
+        f"?search_type=video&keyword={urllib.parse.quote(keyword)}"
+        f"&page=1&order=pubdate&duration=2"  # duration=2: 10-30min
+    )
+    
+    try:
+        req = urllib.request.Request(search_url, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.bilibili.com",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        print(f"  Search failed: {e}")
+        return []
+    
+    results = data.get("data", {}).get("result", [])
+    if not results:
+        print("  No results found")
+        return []
+    
+    print(f"  Found {len(results)} videos, filtering...")
+    
+    curated = []
+    for video in results[:count * 2]:  # oversample
+        title = video.get("title", "").replace("<em class=\"keyword\">", "").replace("</em>", "")
+        bvid = video.get("bvid", "")
+        duration_str = video.get("duration", "0:00")
+        
+        # Parse duration "MM:SS" → seconds
+        parts = duration_str.split(":")
+        dur_sec = int(parts[0]) * 60 + int(parts[1])
+        
+        if dur_sec < 30:  # too short
+            continue
+        if dur_sec > max_dur:
+            continue
+        
+        url = f"https://www.bilibili.com/video/{bvid}"
+        print(f"\n  🎯 {title[:60]} ({dur_sec//60}:{dur_sec%60:02d})")
+        
+        try:
+            result = curate_video(url, output_dir=output_dir, asr_model=asr_model,
+                                 max_duration=max_dur)
+            if result:
+                curated.append(result)
+                if len(curated) >= count:
+                    break
+        except Exception as e:
+            print(f"  ❌ Failed: {e}")
+            continue
+        
+        time.sleep(2)  # rate limit
+    
+    # Summary
+    print(f"\n{'═' * 55}")
+    print(f"🏆 Scouted {len(curated)} videos for \"{keyword}\":")
+    print(f"   Output: {output_dir}/")
+    for i, c in enumerate(curated):
+        print(f"   {i+1}. {c['title'][:50]} — {c['token_savings']}× token savings")
+    print(f"{'═' * 55}")
+    
+    return curated
+
+
 # ── CLI ────────────────────────────────────────────────────────────
 
 def main():
@@ -1207,6 +1303,15 @@ Examples:
     cur.add_argument("--max-duration", type=int, default=3600,
                      help="Max video duration in seconds (default: 3600 = 1h)")
 
+    # --- scout ---
+    sct = sub.add_parser("scout", help="Search B站 + auto-curate videos for AVIS sharing")
+    sct.add_argument("keyword", nargs="?", help="Search keyword (default: random from list)")
+    sct.add_argument("-n", "--count", type=int, default=3, help="Number of videos to curate")
+    sct.add_argument("--max-dur", type=int, default=1800,
+                     help="Max video duration in seconds (default: 1800 = 30min)")
+    sct.add_argument("-o", "--output", help="Output directory")
+    sct.add_argument("--asr-model", default="tiny", choices=["tiny", "base", "small"])
+
     args = parser.parse_args()
 
     if args.command == "encode":
@@ -1254,6 +1359,15 @@ Examples:
             output_dir=Path(args.output) if args.output else None,
             asr_model=args.asr_model,
             max_duration=args.max_duration,
+        )
+
+    elif args.command == "scout":
+        scout_videos(
+            keyword=args.keyword,
+            count=args.count,
+            max_dur=args.max_dur,
+            output_dir=Path(args.output) if args.output else None,
+            asr_model=args.asr_model,
         )
 
     else:
