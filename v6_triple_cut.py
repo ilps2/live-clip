@@ -91,8 +91,9 @@ ASR:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--video", required=True)
-    p.add_argument("--transcript", required=True)
+    p.add_argument("--video")
+    p.add_argument("--transcript")
+    p.add_argument("--avis", help="AVIS 目录路径 (无需 --video --transcript)")
     p.add_argument("--out-dir", default="./v6_out")
     p.add_argument("--api-key")
     p.add_argument("--model", default="deepseek-v4-flash")
@@ -103,6 +104,37 @@ def main():
     p.add_argument("--skip-llm", action="store_true")
     args = p.parse_args()
     
+    manifest = None
+    # AVIS mode: read from AVIS directory
+    if args.avis:
+        avis_dir = Path(args.avis)
+        manifest = json.loads((avis_dir / "avis.json").read_text())
+        args.video = manifest["video"]["path"]
+        args.transcript = str(avis_dir / "transcript.jsonl")
+        
+        # Load scene/timeline for enriched prompt
+        scenes_data = None
+        timeline_data = None
+        scenes_csv = avis_dir / "scenes.csv"
+        timeline_csv = avis_dir / "timeline.csv"
+        if scenes_csv.exists():
+            scenes_data = {}
+            for line in scenes_csv.read_text().splitlines()[1:]:  # skip header
+                parts = line.strip().split(",")
+                if len(parts) >= 2:
+                    scenes_data[int(parts[0])] = parts[1]
+        if timeline_csv.exists():
+            timeline_data = {}
+            for line in timeline_csv.read_text().splitlines()[1:]:
+                parts = line.strip().split(",")
+                if len(parts) >= 2:
+                    timeline_data[int(parts[0])] = float(parts[1])
+    else:
+        if not args.video or not args.transcript:
+            print("ERROR: need --video + --transcript, or --avis"); sys.exit(1)
+        scenes_data = None
+        timeline_data = None
+    
     api_key = args.api_key or os.environ.get("DEEPSEEK_API_KEY")
     if not args.skip_llm and not api_key:
         print("ERROR: need API key"); sys.exit(1)
@@ -110,11 +142,32 @@ def main():
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 60)
+    if args.avis:
+        print(f"📦 AVIS 模式: {args.avis}")
+        print(f"   Video: {args.video}")
+        print(f"   Duration: {manifest['video']['duration']}s")
     print("[1/2] 加载 ASR + LLM...")
     raw = [json.loads(l) for l in open(args.transcript)]
     transcript = [(s["start"], s["text"]) for s in raw]
+    
+    # Word-level timestamps if available
+    word_timestamps = []
+    for s in raw:
+        if "words" in s:
+            word_timestamps.append(s["words"])
+    
     total_dur = transcript[-1][0]
-    print(f"  {len(transcript)} 句, {total_dur:.0f}s")
+    print(f"  {len(transcript)} 句, {total_dur:.0f}s", end="")
+    if word_timestamps:
+        print(f", 词级时间戳 ✅")
+    else:
+        print()
+    if scenes_data:
+        scene_types = set(scenes_data.values())
+        print(f"  场景: {len(scenes_data)}秒数据, 类型: {scene_types}")
+    if timeline_data:
+        peaks = sorted(timeline_data.items(), key=lambda x: -x[1])[:10]
+        print(f"  时间线峰值: {len(peaks)}个 — {[f'{t}s({s:.1f})' for t,s in peaks[:5]]}")
     
     if args.skip_llm:
         llm_path = out_dir / "llm_v6.json" if (out_dir / "llm_v6.json").exists() else Path("/tmp/v6_out/llm_v6.json")
