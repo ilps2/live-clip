@@ -241,6 +241,203 @@ def search_avis(avis_dir: Path, query: str, top_k: int = 5):
     return [(timestamps[idx], float(similarities[idx])) for idx in top_indices]
 
 
+# ── Curate: download + encode + package for distribution ──────────
+
+def curate_video(url: str, output_dir: Path = None, asr_model: str = "tiny",
+                  max_duration: int = 3600):
+    """Download a video from YouTube/B站, encode to AVIS, package for sharing.
+    
+    Returns dict with paths and copy text, or None on failure.
+    """
+    from datetime import datetime
+    import shutil as _shutil
+    import glob as _glob
+    import re as _re
+    
+    # Detect platform
+    is_bilibili = "bilibili.com" in url or "b23.tv" in url
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    
+    if not (is_bilibili or is_youtube):
+        print("ERROR: only YouTube and B站 URLs are supported")
+        return None
+    
+    platform = "bilibili" if is_bilibili else "youtube"
+    print(f"📥 Downloading from {platform}...")
+    
+    # Download with yt-dlp
+    if output_dir is None:
+        output_dir = Path.cwd() / "avis_curated"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Construct yt-dlp command
+    dl_dir = output_dir / "_dl"
+    dl_dir.mkdir(exist_ok=True)
+    
+    # Find yt-dlp: prefer /usr/local/bin/python3 on macOS
+    yt_python = os.environ.get("YT_PYTHON", "")
+    if not yt_python:
+        for candidate in ["/usr/local/bin/python3", "python3"]:
+            r = subprocess.run([candidate, "-c", "import yt_dlp; print('ok')"],
+                              capture_output=True, text=True, timeout=10)
+            if r.stdout.strip() == "ok":
+                yt_python = candidate
+                break
+    
+    yt_cmd = [yt_python, "-m", "yt_dlp"]
+    if is_bilibili:
+        yt_cmd += ["--cookies-from-browser", "chrome"]
+    else:
+        yt_cmd += ["--cookies-from-browser", "chrome", "--remote-components", "ejs:github"]
+    
+    yt_cmd += [
+        "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]",
+        "--embed-metadata", "--merge-output-format", "mp4",
+        "-o", str(dl_dir / "%(title)s.%(ext)s"),
+        "--max-filesize", "3G",
+        url
+    ]
+    
+    print(f"  Running: {' '.join(yt_cmd[:5])}...")
+    r = subprocess.run(yt_cmd, capture_output=True, text=True, timeout=600, cwd=str(dl_dir))
+    
+    if r.returncode != 0:
+        print(f"  Download failed: {r.stderr[-300:]}")
+        return None
+    
+    # Find downloaded file
+    mp4s = sorted(dl_dir.glob("*.mp4"))
+    if not mp4s:
+        print("  No MP4 found after download")
+        return None
+    
+    video_path = mp4s[0]
+    size_mb = video_path.stat().st_size / (1024 * 1024)
+    print(f"  ✅ Downloaded: {video_path.name} ({size_mb:.0f}MB)")
+    
+    # Check duration
+    r = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(video_path)],
+        capture_output=True, text=True)
+    dur = float(json.loads(r.stdout)["format"]["duration"])
+    print(f"  Duration: {dur:.0f}s ({dur/60:.1f}min)")
+    
+    if dur > max_duration:
+        print(f"  ⚠ Video too long ({dur/60:.0f}min > {max_duration/60:.0f}min max)")
+        print(f"  Consider using a shorter clip or raising --max-duration")
+        _shutil.rmtree(dl_dir, ignore_errors=True)
+        return None
+    
+    # Encode to AVIS
+    slug = _re.sub(r'[^\w\-]', '_', video_path.stem)[:80]
+    avis_dir = output_dir / f"{slug}_avis"
+    
+    print(f"\n🔧 Encoding to AVIS...")
+    result = encode_video(video_path, output_dir=output_dir, asr_model=asr_model,
+                         fps_target="auto", use_clip=True)
+    
+    if result is None:
+        _shutil.rmtree(dl_dir, ignore_errors=True)
+        return None
+    
+    # Package
+    pkg_dir = output_dir / slug
+    pkg_dir.mkdir(exist_ok=True)
+    
+    # Copy AVIS data (excluding clips/)
+    for item in result.iterdir():
+        if item.name == "clips":
+            continue
+        dest = pkg_dir / item.name
+        if item.is_dir():
+            if not dest.exists():
+                _shutil.copytree(item, dest)
+        else:
+            _shutil.copy2(item, dest)
+    
+    # Copy source video
+    _shutil.copy2(video_path, pkg_dir / video_path.name)
+    
+    # Cleanup download dir
+    _shutil.rmtree(dl_dir, ignore_errors=True)
+    
+    pkg_size = sum(f.stat().st_size for f in pkg_dir.rglob("*") if f.is_file()) / (1024 * 1024)
+    
+    # Calculate traditional token estimate
+    # ~300 image tokens per frame at 1fps for 720p video
+    trad_tokens = int(dur) * 300
+    
+    # Calculate AVIS token estimate from transcript
+    avis_tokens = 0
+    transcript_path = pkg_dir / "transcript.jsonl"
+    if transcript_path.exists():
+        with open(transcript_path) as f:
+            avis_tokens = sum(len(l) for l in f) // 2  # rough: 2 chars ~ 1 token
+    
+    # Minimum avis_tokens for display (CLIP + manifest overhead)
+    if avis_tokens < 5000:
+        avis_tokens = 5000 + avis_tokens
+    
+    savings = trad_tokens // max(avis_tokens, 1)
+    
+    # Generate copy
+    title = video_path.stem
+    mins = int(dur / 60)
+    secs = int(dur % 60)
+    
+    copy_text = f"""🎬 AVIS Encoded: {title}
+
+📊 {mins}m{secs}s | AVIS package: {pkg_size:.0f}MB
+
+Token comparison (per AI query):
+  传统逐帧理解: {trad_tokens:,} tokens (~¥{trad_tokens/1000*0.01:.1f})
+  AVIS 编码后:   {avis_tokens:,} tokens (~¥{avis_tokens/1000*0.002:.4f})
+  节省:          {savings}×
+
+一次编码，所有模型复用。直接下载 AVIS 数据丢给 LLM，不重新解码像素。
+
+📦 AVIS Package: github.com/ilps2/avis
+🔗 Source: {url}
+"""
+    
+    # Write README
+    readme_path = pkg_dir / "README.md"
+    with open(readme_path, "w") as f:
+        f.write(f"# AVIS: {title}\n\n")
+        f.write(f"- **Duration:** {mins}m{secs}s\n")
+        f.write(f"- **Package:** {pkg_size:.0f}MB\n")
+        f.write(f"- **Source:** {url}\n\n")
+        f.write(f"## Usage\n\n")
+        f.write(f"```bash\n")
+        f.write(f"# Query the video with any LLM\n")
+        f.write(f"cat transcript.jsonl | head -100  # preview transcript\n")
+        f.write(f"avis info .                        # data summary\n")
+        f.write(f"avis search . \"your query\"         # CLIP visual search\n")
+        f.write(f"```\n\n")
+        f.write(f"## Token Comparison\n\n")
+        f.write(f"| Method | Tokens | Cost (DeepSeek) |\n")
+        f.write(f"|--------|--------|-----------------|\n")
+        f.write(f"| Traditional (GPT-4o, 1fps) | {trad_tokens:,} | ~¥{trad_tokens/1000*0.01:.1f} |\n")
+        f.write(f"| AVIS (features only) | {avis_tokens:,} | ~¥{avis_tokens/1000*0.002:.4f} |\n")
+        f.write(f"| **Savings** | **{savings}×** | — |\n\n")
+        f.write(f"## x.com Post\n\n```\n{copy_text}```\n")
+    
+    print(f"\n{'═' * 55}")
+    print(f"✅ AVIS Package: {pkg_dir}/")
+    print(f"   Size: {pkg_size:.0f}MB")
+    print(f"   README: {readme_path.name}")
+    print(f"{'═' * 55}")
+    print(f"\n📱 X.com copy:\n")
+    print(copy_text)
+    
+    return {
+        "dir": pkg_dir,
+        "title": title,
+        "token_savings": trad_tokens // max(avis_tokens, 1),
+        "copy": copy_text,
+    }
+
+
 # ── Encode: extract all signals into AVIS format ──────────────────
 
 def encode_video(video_path: Path, output_dir: Path = None,
@@ -1002,6 +1199,14 @@ Examples:
     srch.add_argument("query", help="Search query (e.g. 'red sports car', 'person on stage')")
     srch.add_argument("-n", "--top", type=int, default=5, help="Number of results")
 
+    # --- curate ---
+    cur = sub.add_parser("curate", help="Download + encode + package a video for sharing")
+    cur.add_argument("url", help="YouTube or B站 video URL")
+    cur.add_argument("-o", "--output", help="Output directory (default: ./avis_curated)")
+    cur.add_argument("--asr-model", default="tiny", choices=["tiny", "base", "small"])
+    cur.add_argument("--max-duration", type=int, default=3600,
+                     help="Max video duration in seconds (default: 3600 = 1h)")
+
     args = parser.parse_args()
 
     if args.command == "encode":
@@ -1042,6 +1247,14 @@ Examples:
 
     elif args.command == "search":
         search_avis(Path(args.avis_dir), args.query, top_k=args.top)
+
+    elif args.command == "curate":
+        curate_video(
+            args.url,
+            output_dir=Path(args.output) if args.output else None,
+            asr_model=args.asr_model,
+            max_duration=args.max_duration,
+        )
 
     else:
         parser.print_help()
