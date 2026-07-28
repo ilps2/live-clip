@@ -449,6 +449,9 @@ def encode_video(video_path: Path, output_dir: Path = None,
     Encode a single video into the AVIS format.
     Steps: probe → MV extraction → ASR → scene classification → scoring → manifest.
     """
+    # Prevent Hermes venv PYTHONPATH contamination
+    os.environ.pop('PYTHONPATH', None)
+    
     video = video_path.resolve()
     if not video.exists():
         print(f"ERROR: {video} not found")
