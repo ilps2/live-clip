@@ -115,18 +115,28 @@ def main():
         print(f"\n❓ Q{i} {q}\n💬 {a}\n", flush=True)
 
     # 4. 汇总
-    cost = (total_in / 1e6 * 1 + total_out / 1e6 * 2) * 7.2  # deepseek 输入1元/M 输出2元/M, 汇率7.2
+    # ── 成本核算（2026-08-17 DeepSeek V4 调价后，人民币计费）──
+    # 模型: deepseek-chat → 实际路由 deepseek-v4-flash
+    # 价格（元/百万 token）：
+    #   输入(缓存未命中) 1.5 (空闲) / 3.0 (高峰)  输入(缓存命中) 0.05/0.10
+    #   输出              4.5 (空闲) / 9.0 (高峰)
+    # 高峰时段: 9-12 / 14-18 点；其余为空闲时段
+    # 注: 原实现误乘 7.2 汇率（DeepSeek 本币计费）已移除
+    PRICE_IN_MISS = float(os.environ.get("AVIS_PRICE_IN", 1.5))
+    PRICE_OUT = float(os.environ.get("AVIS_PRICE_OUT", 4.5))
+    cost = (total_in / 1e6 * PRICE_IN_MISS + total_out / 1e6 * PRICE_OUT)
     elapsed = time.time() - t0
     print("=" * 70)
-    print(f"✅ 完成 | 视频 {dur:.0f}s | 耗时 {elapsed:.0f}s | 信息层 {stats['info']} tok vs 原始逐帧 {stats['orig']:,} tok | 降本 {stats['save']}%")
-    print(f"💵 LLM 成本 ≈ {cost:.4f} 元（输入 {total_in} tok / 输出 {total_out} tok）")
+    print(f"✅ 完成 | 视频 {dur:.0f}s | 耗时 {elapsed:.0f}s | 信息层 {stats['info']} tok vs 原始逐帧 {stats['orig']:,} tok | token 压缩 {stats['save']}%")
+    print(f"💵 LLM 成本 ≈ {cost:.4f} 元（v4-flash 空闲价；输入 {total_in} tok / 输出 {total_out} tok；'降本'为 token 压缩率，非账单对比）")
 
     # 保存报告
     report = os.path.join(args.workdir, "report.md")
     with open(report, "w", encoding="utf-8") as f:
         f.write(f"# 视频理解报告\n\n- 视频: {os.path.basename(video_path)}\n- 时长: {dur:.0f}s\n")
         f.write(f"- 信息层: {stats['info']} tok (ASR {stats['asr']} + 轨迹 {stats['tracks']}×60 + 结构 150)\n")
-        f.write(f"- 原始逐帧估算: {stats['orig']:,} tok → 降本 {stats['save']}%\n- LLM 成本: {cost:.4f} 元\n\n")
+        f.write(f"- 原始逐帧估算: {stats['orig']:,} tok → token 压缩 {stats['save']}%\n")
+        f.write(f"- LLM 成本: {cost:.4f} 元（deepseek-v4-flash 空闲价；token 压缩率为信息层/逐帧估算 token 比，非账单对比）\n\n")
         for i, (q, a) in enumerate(zip(args.ask or DEFAULT_QUESTIONS, answers), 1):
             f.write(f"## Q{i} {q}\n\n{a}\n\n")
     print(f"📄 报告: {report}")
