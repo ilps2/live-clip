@@ -94,8 +94,22 @@ def auto_fps(source_fps: float, duration_sec: float) -> int:
 
 # ── CLIP Semantic Indexing ─────────────────────────────────────────
 
+def _get_auto_device():
+    """自动检测最佳 torch 设备。"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        elif torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
+
 def extract_clip_embeddings(video_path: Path, avis_dir: Path,
-                             clip_every: int = 5, max_frames: int = 500):
+                             clip_every: int = 5, max_frames: int = 500,
+                             device: str = "auto"):
     """Extract CLIP ViT-B-32 embeddings from keyframes for visual search.
     
     Returns (embeddings_np, frame_timestamps) or (None, None) on failure.
@@ -128,8 +142,14 @@ def extract_clip_embeddings(video_path: Path, avis_dir: Path,
         os.environ.pop(var, None)
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
     
-    # Load model (cpu, local cache first)
-    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", local_files_only=True)
+    # Auto-detect device
+    if device == "auto":
+        device = _get_auto_device()
+    
+    # Load model on selected device
+    import torch
+    torch_device = torch.device(device)
+    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", local_files_only=True).to(torch_device)
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", local_files_only=True)
     model.eval()
     
@@ -165,6 +185,7 @@ def extract_clip_embeddings(video_path: Path, avis_dir: Path,
             
             if frames:
                 inputs = processor(images=frames, return_tensors="pt", padding=True)
+                inputs = {k: v.to(torch_device) for k, v in inputs.items()}
                 with torch.no_grad():
                     batch_emb = model.get_image_features(**inputs)
                     if hasattr(batch_emb, 'pooler_output'):
@@ -172,7 +193,7 @@ def extract_clip_embeddings(video_path: Path, avis_dir: Path,
                     elif hasattr(batch_emb, 'image_embeds'):
                         batch_emb = batch_emb.image_embeds
                     batch_emb = batch_emb / batch_emb.norm(dim=-1, keepdim=True)
-                embeddings.extend(batch_emb.numpy().tolist())
+                embeddings.extend(batch_emb.cpu().numpy().tolist())
             
             print(f"  [{batch_start + 1}-{min(batch_start + batch_size, len(timestamps))}/{len(timestamps)}]")
     finally:
@@ -242,6 +263,37 @@ def search_avis(avis_dir: Path, query: str, top_k: int = 5):
 
 
 # ── Curate: download + encode + package for distribution ──────────
+
+def _ensure_h264(video_path: Path) -> Path:
+    """If video codec is AV1/VP9/VP8, transcode to H.264 for MV extraction.
+    PyAV export_mvs only supports H.264/H.265 — other codecs produce all-zero MV.
+    Returns the (possibly new) video path."""
+    NECESSARY = frozenset({"av1", "vp9", "vp8"})
+    r = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_name", "-of", "csv=p=0",
+         str(video_path)], capture_output=True, text=True)
+    codec = r.stdout.strip().lower()
+    if codec not in NECESSARY:
+        return video_path
+
+    print(f"  ⚠ {codec.upper()} codec — PyAV MVs not supported, transcoding to H.264...")
+    h264_path = video_path.with_stem(video_path.stem + "_h264").with_suffix(".mp4")
+    r = subprocess.run([
+        "ffmpeg", "-y", "-v", "error",
+        "-i", str(video_path),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(h264_path)
+    ], capture_output=True, text=True, timeout=900)
+    if r.returncode != 0 or not h264_path.exists():
+        print(f"  ❌ Transcode failed ({r.stderr[-120:] if r.stderr else 'unknown'}) — continuing with {codec} (MV may be zero)")
+        return video_path
+    size_mb = h264_path.stat().st_size / (1024 * 1024)
+    print(f"  ✅ H.264 ready: {h264_path.name} ({size_mb:.0f}MB)")
+    return h264_path
+
 
 def curate_video(url: str, output_dir: Path = None, asr_model: str = "tiny",
                   max_duration: int = 3600):
@@ -314,6 +366,9 @@ def curate_video(url: str, output_dir: Path = None, asr_model: str = "tiny",
     video_path = mp4s[0]
     size_mb = video_path.stat().st_size / (1024 * 1024)
     print(f"  ✅ Downloaded: {video_path.name} ({size_mb:.0f}MB)")
+
+    # Ensure H.264 for MV extraction (PyAV doesn't support AV1/VP9)
+    video_path = _ensure_h264(video_path)
     
     # Check duration
     r = subprocess.run(
@@ -438,12 +493,377 @@ Token comparison (per AI query):
     }
 
 
+# ── obj_tracks: motion-object detection + tracking (optional signal) ──
+
+def _bbox_iou(a, b):
+    """IoU of two bboxes [x,y,w,h]."""
+    ax1, ay1, ax2, ay2 = a[0], a[1], a[0]+a[2], a[1]+a[3]
+    bx1, by1, bx2, by2 = b[0], b[1], b[0]+b[2], b[1]+b[3]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    union = a[2]*a[3] + b[2]*b[3] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _describe_motion(dx, dy):
+    """Coarse motion direction label from centroid displacement."""
+    if abs(dx) < 3 and abs(dy) < 3:
+        return "stationary"
+    if abs(dx) > abs(dy) * 1.5:
+        return "L→R" if dx > 0 else "R→L"
+    if abs(dy) > abs(dx) * 1.5:
+        return "top→bottom" if dy > 0 else "bottom→top"
+    return "diagonal"
+
+
+def extract_obj_tracks(video_path: Path, avis_dir: Path, fps_target: int = 5,
+                       max_objects: int = 12, min_track_sec: float = 0.6,
+                       iou_thresh: float = 0.15):
+    """
+    OpenCV motion-object detection (MOG2) + greedy IoU tracking.
+    Writes obj_tracks.jsonl — one JSON object per tracked object:
+      {"obj_id", "appear_t", "disappear_t", "duration_sec", "n_frames",
+       "motion", "speed_px_s", "centroid_path": [[t,cx,cy],...]}
+
+    Returns number of tracks (0 if opencv missing or nothing moved).
+    Cost: ~1-2x realtime on Apple Silicon (no neural nets, pixel-level only).
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        print("  ⚠️ obj_tracks: opencv not installed — skipping")
+        return 0
+
+    print("\n[obj_tracks] Detecting motion objects (MOG2 + IoU tracking)...")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print("  ⚠️ obj_tracks: cannot open video")
+        return 0
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    if src_fps <= 0:
+        src_fps = 30.0
+    step = max(1, int(round(src_fps / max(1, fps_target))))
+    bg = cv2.createBackgroundSubtractorMOG2(history=200, varThreshold=36, detectShadows=True)
+
+    tracks = []
+    next_id = 0
+    frame_i = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if frame_i % step != 0:
+            frame_i += 1
+            continue
+        t = frame_i / src_fps
+        frame_i += 1
+        mask = bg.apply(frame)
+        mask = (mask > 200).astype('uint8') * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+        n, labels, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+        dets = []
+        for i in range(1, n):
+            x, y, w, h, area = stats[i]
+            if area < 250 or w < 12 or h < 12:
+                continue
+            if w > frame.shape[1] * 0.92 or h > frame.shape[0] * 0.92:
+                continue  # ignore full-frame foreground (camera shake)
+            cx, cy = cents[i]
+            dets.append((int(x), int(y), int(w), int(h), int(cx), int(cy), int(area)))
+
+        # greedy IoU matching
+        used = set()
+        for tr in tracks:
+            if tr['missed'] > 12:
+                continue
+            best_i, best_iou = -1, iou_thresh
+            for di, d in enumerate(dets):
+                if di in used:
+                    continue
+                iou = _bbox_iou(tr['last_bbox'], d[:4])
+                if iou > best_iou:
+                    best_iou, best_i = iou, di
+            if best_i >= 0:
+                used.add(best_i)
+                d = dets[best_i]
+                tr['frames'].append([round(t, 2), d[0], d[1], d[2], d[3], d[4], d[5]])
+                tr['last_bbox'] = d[:4]
+                tr['last_t'] = t
+                tr['missed'] = 0
+            else:
+                tr['missed'] += 1
+        for di, d in enumerate(dets):
+            if di in used:
+                continue
+            if len(tracks) >= max_objects * 4:  # hard cap on live tracks
+                break
+            tracks.append({'id': next_id, 'appear_t': t, 'last_t': t,
+                           'frames': [[round(t, 2), d[0], d[1], d[2], d[3], d[4], d[5]]],
+                           'last_bbox': d[:4], 'missed': 0})
+            next_id += 1
+    cap.release()
+
+    objs = []
+    for tr in tracks:
+        dur = tr['last_t'] - tr['appear_t']
+        if dur < min_track_sec:
+            continue
+        xs = [f[5] for f in tr['frames']]
+        ys = [f[6] for f in tr['frames']]
+        dx = xs[-1] - xs[0]
+        dy = ys[-1] - ys[0]
+        motion = _describe_motion(dx, dy)
+        speed = (dx ** 2 + dy ** 2) ** 0.5 / dur if dur > 0 else 0
+        # subsample centroid path to ≤30 points
+        pts = tr['frames']
+        if len(pts) > 30:
+            idx = [int(i * (len(pts) - 1) / 29) for i in range(30)]
+            pts = [pts[i] for i in idx]
+        objs.append({
+            'obj_id': tr['id'],
+            'appear_t': round(tr['appear_t'], 1),
+            'disappear_t': round(tr['last_t'], 1),
+            'duration_sec': round(dur, 1),
+            'n_frames': len(tr['frames']),
+            'motion': motion,
+            'speed_px_s': round(speed, 1),
+            'centroid_path': [[f[0], f[5], f[6]] for f in pts],
+        })
+
+    objs.sort(key=lambda o: o['appear_t'])
+    if len(objs) > max_objects:
+        objs = objs[:max_objects]
+    out = avis_dir / "obj_tracks.jsonl"
+    with open(out, "w", encoding="utf-8") as f:
+        for o in objs:
+            f.write(json.dumps(o, ensure_ascii=False) + "\n")
+    print(f"  ✅ obj_tracks: {len(objs)} objects tracked → {out.name}")
+    return len(objs)
+
+
+def classify_video(video_path: Path, use_asr: bool = False):
+    """
+    Video-type router: cheap signals only (frame-diff + color stats + optional ASR).
+    Returns the recommended understanding strategy per video type.
+
+    Signals (all sub-penny, no neural nets):
+      - static_ratio: fraction of uniform-sampled adjacent frames with <2% diff
+      - nature_ratio: green/sky-blue pixel share (scenery heuristic)
+      - speech_ratio: ASR-covered seconds / duration (only if use_asr)
+      - motion_score: mean frame-diff magnitude
+
+    Routing:
+      static + nature → static_scenery → uniform sparse frames
+      high motion     → motion_dense   → MV + obj_tracks
+      speech-heavy    → speech_dense   → pure ASR
+      else            → mixed          → full AVIS info layer
+    """
+    import numpy as np
+    try:
+        import cv2
+    except ImportError:
+        raise SystemExit("opencv required for classify")
+
+    print(f"\n[classify] Probing {video_path.name}...")
+    meta = probe(video_path)
+    dur = meta["duration"]
+    print(f"  {dur:.0f}s | {meta['width']}x{meta['height']} | {meta['codec']}")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise SystemExit("cannot open video")
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    step = max(1, int(round(src_fps * 2)))  # 1 frame per 2s
+    frames = []
+    frame_i = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if frame_i % step == 0:
+            small = cv2.resize(frame, (160, 90))
+            frames.append((frame_i / src_fps, small))
+        frame_i += 1
+        if len(frames) > 120:  # cap sampling
+            break
+    cap.release()
+    if len(frames) < 2:
+        raise SystemExit("too few frames")
+
+    # frame-diff → motion / static
+    diffs = []
+    for i in range(1, len(frames)):
+        t0, f0 = frames[i - 1]
+        t1, f1 = frames[i]
+        g0 = cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        g1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        mean_abs = np.abs(g1 - g0).mean()
+        diffs.append((t1, mean_abs))
+    diff_vals = [d[1] for d in diffs]
+    motion_score = float(np.mean(diff_vals))
+    static_ratio = float(np.mean([1 if d < 2.0 else 0 for d in diff_vals]))
+
+    # color stats (nature heuristic: green + sky blue share)
+    greens, blues = [], []
+    for t, f in frames[::max(1, len(frames) // 30)]:
+        hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
+        h, s, v = hsv[:, :, 0].astype(int), hsv[:, :, 1].astype(int), hsv[:, :, 2].astype(int)
+        total = h.size
+        green = ((h > 35) & (h < 90) & (s > 40) & (v > 40)).sum() / total
+        blue = ((h > 95) & (h < 130) & (s > 30) & (v > 40)).sum() / total
+        greens.append(green)
+        blues.append(blue)
+    nature_ratio = float(np.mean(greens)) + float(np.mean(blues))
+
+    speech_ratio = 0.0
+    if use_asr:
+        import json as _json
+        avis_dir = video_path.parent / f"{video_path.stem}_classify_tmp"
+        avis_dir.mkdir(exist_ok=True)
+        tr = avis_dir / "transcript.jsonl"
+        if not tr.exists():
+            print("  [classify] Running ASR (faster-whisper tiny, ~8-12x realtime)...")
+            try:
+                r = run([sys.executable, str(BASE / "livestream-highlight" / "asr.py"),
+                         "--video", str(video_path), "--out", str(tr),
+                         "--model", "tiny", "--device", "auto"], desc="ASR", timeout=900)
+            except Exception as e:
+                print(f"  ⚠️ ASR failed: {e}")
+        if tr.exists():
+            segs = [_json.loads(l) for l in tr.read_text(encoding="utf-8").splitlines() if l.strip()]
+            covered = sum(min(seg.get("end", seg.get("start", 0) + 1), dur) - seg.get("start", 0)
+                          for seg in segs if seg.get("text", "").strip())
+            speech_ratio = min(1.0, covered / dur if dur > 0 else 0)
+            print(f"  [classify] ASR: {len(segs)} segments, speech coverage {speech_ratio*100:.0f}%")
+
+    # routing
+    type_ = "mixed"
+    strategy = "full AVIS info layer (ASR + scenes + MV + optional obj_tracks)"
+    if static_ratio > 0.6 and nature_ratio > 0.25:
+        type_ = "static_scenery"
+        strategy = "uniform sparse frames (every 2s) — motion/ASR signals are empty"
+    elif speech_ratio > 0.6:
+        type_ = "speech_dense"
+        strategy = "pure ASR transcript (audio-dominant content)"
+    elif motion_score > 4.0:
+        type_ = "motion_dense"
+        strategy = "MV + obj_tracks (motion-object trajectories)"
+    elif static_ratio > 0.5:
+        type_ = "static_scenery_low_conf"
+        strategy = "sparse frames + ASR fallback"
+
+    # token estimate
+    if type_ == "static_scenery":
+        est = int(dur / 2) * 1000
+    elif type_ == "speech_dense":
+        est = int(dur * 1.5 * 5)  # ~5 words/sec
+    elif type_ == "motion_dense":
+        est = int(dur / 4) * 60
+    else:
+        est = int(dur * 2 * 3)
+
+    result = {
+        "type": type_,
+        "signals": {
+            "motion_score": round(motion_score, 2),
+            "static_ratio": round(static_ratio, 2),
+            "nature_ratio": round(nature_ratio, 2),
+            "speech_ratio": round(speech_ratio, 2),
+        },
+        "recommended_strategy": strategy,
+        "est_tokens": est,
+    }
+    return result
+
+
+def build_fused_prompt(avis_dir: Path, with_tracks: bool = True) -> str:
+    """
+    Build a fused LLM prompt from the AVIS information layer:
+      ASR transcript + scene structure + MV rhythm + obj_tracks (motion objects).
+    This is the "video RAG" prompt — tokens ≈ tens of K instead of millions.
+    """
+    avis_dir = Path(avis_dir)
+    m_path = avis_dir / "avis.json"
+    if not m_path.exists():
+        raise SystemExit(f"No avis.json in {avis_dir}")
+    m = json.loads(m_path.read_text(encoding="utf-8"))
+    dur = m["video"].get("duration", 0)
+    w = m["video"].get("width", 0)
+    h = m["video"].get("height", 0)
+
+    parts = []
+    parts.append(f"# 视频信息层（AVIS + obj_tracks 融合）")
+    parts.append(f"- 时长 {dur:.0f}s（{dur/60:.1f}min）| {w}x{h}")
+    parts.append("")
+
+    # ASR
+    tr_path = avis_dir / "transcript.jsonl"
+    if tr_path.exists():
+        segs = [json.loads(l) for l in tr_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        if segs:
+            parts.append("## 说了什么（语音转写，时间戳）")
+            for seg in segs[:200]:
+                t0 = seg.get("start", 0)
+                txt = seg.get("text", "").strip()
+                if txt:
+                    parts.append(f"- [{t0:.1f}s] {txt}")
+            if len(segs) > 200:
+                parts.append(f"- …（共 {len(segs)} 段，已截前 200）")
+            parts.append("")
+
+    # Scenes
+    sc_path = avis_dir / "scenes.csv"
+    if sc_path.exists():
+        rows = [l.strip() for l in sc_path.read_text(encoding="utf-8").splitlines()
+                if l.strip() and not l.strip().lower().startswith("sec,")]
+        if rows:
+            parts.append("## 结构（场景分类）")
+            parts.append(f"- 场景边界 {len(rows)} 个：{', '.join(rows[:12])}")
+            parts.append("")
+
+    # obj_tracks
+    if with_tracks:
+        trk_path = avis_dir / "obj_tracks.jsonl"
+        if trk_path.exists():
+            objs = [json.loads(l) for l in trk_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            if objs:
+                parts.append("## 谁在动（运动对象轨迹）")
+                for o in objs[:30]:
+                    path_pts = o.get("centroid_path", [])
+                    start = path_pts[0] if path_pts else []
+                    end = path_pts[-1] if path_pts else []
+                    parts.append(
+                        f"- 对象#{o.get('obj_id')} [{o.get('appear_t')}s→{o.get('disappear_t')}s] "
+                        f"运动:{o.get('motion')} 速度:{o.get('speed_px_s')}px/s "
+                        f"起({start[1] if len(start)>1 else '?'},{start[2] if len(start)>2 else '?'}) "
+                        f"止({end[1] if len(end)>1 else '?'},{end[2] if len(end)>2 else '?'})"
+                    )
+                if len(objs) > 30:
+                    parts.append(f"- …（共 {len(objs)} 个对象，已截前 30）")
+                parts.append("")
+
+    parts.append("## 任务")
+    parts.append("基于以上信息层，描述视频内容：发生了什么、有哪些对象和运动、结构如何。")
+    parts.append("若信息不足，明确说明缺失了什么，不要编造。")
+    return "\n".join(parts)
+
+
 # ── Encode: extract all signals into AVIS format ──────────────────
 
 def encode_video(video_path: Path, output_dir: Path = None,
                  asr_model: str = "base", fps_target: str = "auto",
                  skip_mv: bool = False, skip_asr: bool = False,
                  use_clip: bool = False,
+                 use_obj_tracks: bool = False,
+                 device: str = "auto",
                  keep_intermediate: bool = True):
     """
     Encode a single video into the AVIS format.
@@ -492,10 +912,9 @@ def encode_video(video_path: Path, output_dir: Path = None,
         print(f"  Using existing {mv_path}")
         has_mv = True
     else:
-        max_frames = int(dur * ft * 1.5)
         r = run([sys.executable, str(BASE / "motion-signature" / "extract_mv.py"),
                  "--input", str(video), "--out", str(mv_path),
-                 "--max-frames", str(max_frames)],
+                 "--target-fps", str(ft)],
                 desc="MV extraction", timeout=600)
         has_mv = (r.returncode == 0 and mv_path.exists())
         if not has_mv:
@@ -507,9 +926,11 @@ def encode_video(video_path: Path, output_dir: Path = None,
     if skip_asr and transcript_path.exists():
         print(f"  Using existing {transcript_path}")
     else:
+        # faster-whisper doesn't support MPS — let asr.py auto-detect (falls back to CPU)
+        asr_device = "auto" if device in ("mps", "auto") else device
         r = run([sys.executable, str(BASE / "livestream-highlight" / "asr.py"),
                  "--video", str(video), "--out", str(transcript_path),
-                 "--model", asr_model], desc="ASR", timeout=900)
+                 "--model", asr_model, "--device", asr_device], desc="ASR", timeout=900)
 
     segs = []
     n_segs = 0
@@ -552,18 +973,32 @@ def encode_video(video_path: Path, output_dir: Path = None,
     import numpy as np
     import pandas as pd
 
-    # Soft promo patterns
-    SOFT = [
+    # Soft promo patterns (Chinese e-commerce + English interview excitement)
+    SOFT_ZH = [
         ("拍下", 0.7), ("下单", 0.8), ("价格", 0.5), ("优惠", 0.6),
         ("福利", 0.6), ("券", 0.5), ("放心拍", 0.7), ("去下单", 0.8),
         ("链接", 0.8), ("尺码", 0.3), ("颜色", 0.3), ("首发", 0.6),
         ("上市", 0.5), ("限时", 0.6), ("元", 0.3),
     ]
+    SOFT_EN = [
+        # Emotional peaks / storytelling
+        ("unbelievable", 0.7), ("incredible", 0.7), ("shocking", 0.8),
+        ("let me tell you", 0.6), ("listen", 0.5), ("I swear", 0.7),
+        ("honest to God", 0.7), ("true story", 0.6), ("you know what", 0.5),
+        # Conflict / tension
+        ("gun", 0.9), ("kill", 0.9), ("murder", 0.9), ("shot", 0.8),
+        ("prison", 0.7), ("arrest", 0.7), ("police", 0.6), ("FBI", 0.7),
+        ("mafia", 0.6), ("crime", 0.6), ("mob", 0.6),
+        # Audience reaction
+        ("(laughter)", 0.5), ("(applause)", 0.6), ("(crowd", 0.4),
+    ]
+    SOFT = SOFT_ZH + SOFT_EN
     promo_events = []
     for s in segs:
-        w_text = sum(wt for pat, wt in SOFT if pat in s["text"])
+        text_lower = s["text"].lower()
+        w_text = sum(wt for pat, wt in SOFT if pat.lower() in text_lower)
         if w_text > 0:
-            promo_events.append({"t": (s["start"] + s["end"]) / 2, "weight": min(w_text, 2.5)})
+            promo_events.append({"t": (s["start"] + s["end"]) / 2, "weight": min(w_text, 3.0)})
 
     # Voice activity
     va = np.zeros(int(dur) + 2)
@@ -585,8 +1020,8 @@ def encode_video(video_path: Path, output_dir: Path = None,
 
     if fmt == "launch":
         sp_dense = pd.Series(va_s).rolling(20, center=True, min_periods=1).mean().to_numpy()
-        score = scene_w[:len(secs)] * (1.0 + sp_dense)
-        threshold = float(np.percentile(score[score > 0.3], 40)) if (score > 0.3).any() else 0.5
+        score = scene_w[:len(secs)] * (1.0 + 0.5 * np.maximum(promo_z, 0) + sp_dense)
+        threshold = float(np.percentile(score[score > 0.3], 50)) if (score > 0.3).any() else 0.5
     else:
         score = scene_w[:len(secs)] * (1.0 + 1.5 * np.maximum(promo_z, 0) + 0.5 * va_s)
         threshold = 1.0
@@ -612,9 +1047,16 @@ def encode_video(video_path: Path, output_dir: Path = None,
                 out.append(p)
         return out
 
-    peaks = find_peaks(score, dist=max(60, int(dur / 10)))
+    peaks = find_peaks(score, dist=max(30, int(dur / 25)))
     peaks_sorted = sorted([(score[p], p) for p in peaks], reverse=True)
     print(f"  Peaks: {len(peaks_sorted)} | Threshold: {threshold:.2f}")
+
+    # --- Step 5.5: obj_tracks (optional) ---
+    has_obj_tracks = False
+    n_obj_tracks = 0
+    if use_obj_tracks:
+        n_obj_tracks = extract_obj_tracks(video, avis_dir, fps_target=ft)
+        has_obj_tracks = n_obj_tracks > 0
 
     # --- Step 6: Write manifest ---
     print("\n[6/6] Writing AVIS manifest...")
@@ -622,7 +1064,7 @@ def encode_video(video_path: Path, output_dir: Path = None,
     # --- CLIP semantic indexing (optional) ---
     has_clip = False
     if use_clip:
-        emb, clip_ts = extract_clip_embeddings(video, avis_dir)
+        emb, clip_ts = extract_clip_embeddings(video, avis_dir, device=device)
         has_clip = emb is not None
     
     manifest = {
@@ -647,6 +1089,11 @@ def encode_video(video_path: Path, output_dir: Path = None,
                 "path": "clip.npz",
                 "available": has_clip,
             },
+            "obj_tracks": {
+                "path": "obj_tracks.jsonl",
+                "available": has_obj_tracks,
+                "objects": n_obj_tracks,
+            },
         },
         "timeline": {
             "path": "timeline.csv",
@@ -663,6 +1110,7 @@ def encode_video(video_path: Path, output_dir: Path = None,
     print(f"\n  ✅ AVIS encoded: {avis_dir}/")
     bits = [f"MV: {'✅' if has_mv else '❌'}", f"ASR: {n_segs} segs", f"Scenes: {n_boundaries} boundaries"]
     if has_clip: bits.append("CLIP: ✅")
+    if use_obj_tracks: bits.append(f"ObjTracks: {n_obj_tracks}")
     print(f"     {' | '.join(bits)}")
     return avis_dir
 
@@ -741,7 +1189,7 @@ def clip_from_avis(avis_dir: Path, max_clips: int = 3,
                 out.append(p)
         return out
 
-    peaks = find_peaks(score, dist=max(60, int(dur / 10)))
+    peaks = find_peaks(score, dist=max(30, int(dur / 25)))
     peaks_sorted = sorted([(score[p], p) for p in peaks], reverse=True)
 
     # --- Clip generation ---
@@ -830,6 +1278,10 @@ def clip_from_avis(avis_dir: Path, max_clips: int = 3,
                 break
 
     # --- Sticker overlay setup ---
+    sticker_top = sticker_bot = None
+    bar_h_top = bar_h_bot = 0
+    all_sticker_variants = {}
+    all_sticker_pngs = {}  # init for --no-sticker mode
     sticker_top = sticker_bot = None
     bar_h_top = bar_h_bot = 0
     all_sticker_variants = {}
@@ -1264,6 +1716,7 @@ Examples:
     enc.add_argument("--skip-mv", action="store_true", help="Skip MV if already exists")
     enc.add_argument("--skip-asr", action="store_true", help="Skip ASR if already exists")
     enc.add_argument("--clip", action="store_true", help="Extract CLIP semantic embeddings for visual search")
+    enc.add_argument("--obj-tracks", action="store_true", help="Extract motion-object tracks (MOG2 + IoU) to obj_tracks.jsonl")
 
     # --- batch ---
     bat = sub.add_parser("batch", help="Batch encode all videos in directory")
@@ -1286,6 +1739,14 @@ Examples:
     # --- info ---
     inf = sub.add_parser("info", help="Show AVIS data summary")
     inf.add_argument("avis_dir", help="AVIS directory")
+    # --- prompt ---
+    prm = sub.add_parser("prompt", help="Build a fused LLM prompt from AVIS info layer (+ obj_tracks)")
+    prm.add_argument("avis_dir", help="AVIS directory (contains avis.json)")
+    prm.add_argument("--no-tracks", action="store_true", help="Exclude obj_tracks from prompt")
+    # --- classify ---
+    cls_ = sub.add_parser("classify", help="Route video type via cheap signals (frame-diff + color + optional ASR)")
+    cls_.add_argument("video", help="Input video path")
+    cls_.add_argument("--asr", action="store_true", help="Also run ASR to detect speech-dense videos")
 
     # --- export ---
     exp = sub.add_parser("export", help="Export clips from AVIS data")
@@ -1326,6 +1787,7 @@ Examples:
             skip_mv=args.skip_mv,
             skip_asr=args.skip_asr,
             use_clip=getattr(args, 'clip', False),
+            use_obj_tracks=getattr(args, 'obj_tracks', False),
         )
 
     elif args.command == "batch":
@@ -1352,6 +1814,14 @@ Examples:
 
     elif args.command == "export":
         export_clips(args.avis_dir, args.output)
+
+    elif args.command == "prompt":
+        print(build_fused_prompt(Path(args.avis_dir), with_tracks=not getattr(args, 'no_tracks', False)))
+
+    elif args.command == "classify":
+        import json as _json
+        res = classify_video(Path(args.video), use_asr=getattr(args, 'asr', False))
+        print("\n" + _json.dumps(res, ensure_ascii=False, indent=2))
 
     elif args.command == "search":
         search_avis(Path(args.avis_dir), args.query, top_k=args.top)

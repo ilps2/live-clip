@@ -257,6 +257,10 @@ def stream_encode(url: str, output_dir: Path, asr_model: str = "tiny",
     size_mb = video_path.stat().st_size / (1024 * 1024)
     print(f"  ✅ {video_path.name} ({size_mb:.0f}MB) — {time.time() - t0:.0f}s")
 
+    # Ensure H.264 for MV (PyAV doesn't support AV1/VP9)
+    from avis import _ensure_h264
+    video_path = _ensure_h264(video_path)
+
     # Probe
     meta = probe_video(video_path)
     dur = meta["duration"]

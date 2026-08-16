@@ -36,3 +36,5 @@ Thumbs.db
 results/
 real_fusion/sample2/segments/
 real_fusion/sample2/segments2/
+# Compiled binaries (auto-generated from .swift source)
+text2png_bin

@@ -19,7 +19,7 @@ GRID_W x GRID_H（默认 48x27，即每格 16x16 像素块约 2 个宏块），
 每格取覆盖块 MV 的幅度加权平均。
 
 用法:
-    python extract_mv.py --input video.flv --out results/mv.npz [--max-frames 300]
+    python extract_mv.py --input video.flv --out results/mv.npz [--target-fps 3]
 
 输出 npz:
     mag:  (T, GRID_H, GRID_W) float32 块级运动幅度
@@ -64,35 +64,65 @@ def frame_to_grid(mvs, width, height, gw=GRID_W, gh=GRID_H):
            (vy / safe).astype(np.float32)
 
 
-def extract(video_path: str, max_frames: int | None = None,
+def _source_fps(stream):
+    """从 PyAV stream 获取源帧率。"""
+    rate = stream.average_rate
+    if rate is not None and rate > 0:
+        return float(rate)
+    rate = stream.guessed_rate
+    if rate is not None and rate > 0:
+        return float(rate)
+    return 30.0  # fallback
+
+
+def extract(video_path: str, target_fps: float = 3.0,
             gw=GRID_W, gh=GRID_H, progress=200):
+    """均匀采样提取运动矢量，覆盖整个视频时长。
+    
+    Args:
+        target_fps: 目标采样帧率。根据源帧率计算采样间隔，
+                   确保均匀覆盖整个视频，而非只取前 N 帧。
+    """
     container = av.open(video_path)
     stream = container.streams.video[0]
     stream.codec_context.options = {"flags2": "+export_mvs"}
     W, H = stream.codec_context.width, stream.codec_context.height
+    src_fps = _source_fps(stream)
+    frame_interval = max(1, round(src_fps / target_fps))
 
     mags, dirxs, dirys, pts_list, picts = [], [], [], [], []
     pict_names = {1: "I", 2: "P", 3: "B"}
-    for i, frame in enumerate(container.decode(stream)):
-        if max_frames and i >= max_frames:
-            break
-        sd = frame.side_data.get("MOTION_VECTORS")
-        if sd is None or len(sd) == 0:  # I 帧或无 MV
-            mag = np.zeros((gh, gw), np.float32)
-            dx = dy = np.zeros((gh, gw), np.float32)
-        else:
-            mag, dx, dy = frame_to_grid(sd, W, H, gw, gh)
-        mags.append(mag); dirxs.append(dx); dirys.append(dy)
-        pts_list.append(float(frame.pts * stream.time_base) if frame.pts is not None else i / 30)
-        picts.append(pict_names.get(int(frame.pict_type), "?"))
-        if progress and (i + 1) % progress == 0:
-            print(f"[mv] {i+1} frames", flush=True)
+    frame_idx = 0
+    processed = 0
+    
+    for frame in container.decode(stream):
+        if frame_idx % frame_interval == 0:
+            sd = frame.side_data.get("MOTION_VECTORS")
+            if sd is None or len(sd) == 0:  # I 帧或无 MV
+                mag = np.zeros((gh, gw), np.float32)
+                dx = dy = np.zeros((gh, gw), np.float32)
+            else:
+                mag, dx, dy = frame_to_grid(sd, W, H, gw, gh)
+            mags.append(mag)
+            dirxs.append(dx)
+            dirys.append(dy)
+            pts_list.append(float(frame.pts * stream.time_base) if frame.pts is not None else frame_idx / src_fps)
+            picts.append(pict_names.get(int(frame.pict_type), "?"))
+            processed += 1
+            if progress and processed % progress == 0:
+                print(f"[mv] {processed} frames (sampled)", flush=True)
+        frame_idx += 1
+    
     container.close()
+    
+    # 兼容性：保留 max_frames 语义但不再截断
     return {
         "mag": np.stack(mags), "dirx": np.stack(dirxs), "diry": np.stack(dirys),
         "pts": np.array(pts_list), "pict": np.array(picts),
         "meta": {"width": W, "height": H, "grid_w": gw, "grid_h": gh,
-                 "source": video_path, "method": "pyav export_mvs (encoder MVs)"},
+                 "source": video_path, "method": "pyav export_mvs (encoder MVs)",
+                 "source_fps": src_fps, "target_fps": target_fps,
+                 "frame_interval": frame_interval},
     }
 
 
@@ -100,21 +130,24 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--out", default="results/mv.npz")
-    ap.add_argument("--max-frames", type=int, default=None)
+    ap.add_argument("--target-fps", type=float, default=3.0,
+                    help="目标采样帧率（均匀采样覆盖整个视频，默认 3fps）")
     ap.add_argument("--grid", default=f"{GRID_W}x{GRID_H}")
     args = ap.parse_args()
     gw, gh = map(int, args.grid.split("x"))
 
-    data = extract(args.input, args.max_frames, gw, gh)
+    data = extract(args.input, target_fps=args.target_fps, gw=gw, gh=gh)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out, **data)
     meta_path = out.with_suffix(".meta.json")
     meta_path.write_text(json.dumps(data["meta"], ensure_ascii=False, indent=2))
-    n_p = int((data["pict"] == "P").sum()); n_b = int((data["pict"] == "B").sum())
+    n_p = int((data["pict"] == "P").sum())
+    n_b = int((data["pict"] == "B").sum())
     n_i = int((data["pict"] == "I").sum())
+    pts_range = float(data["pts"].max() - data["pts"].min())
     print(f"[mv] done: {len(data['pts'])} frames (I={n_i} P={n_p} B={n_b}) "
-          f"grid={gw}x{gh} -> {out}")
+          f"pts=[0..{pts_range:.0f}s] grid={gw}x{gh} -> {out}")
 
 
 if __name__ == "__main__":

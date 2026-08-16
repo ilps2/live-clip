@@ -1,18 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""asr.py — 视频音频转录（faster-whisper，CPU 可跑）。
+"""asr.py — 视频音频转录（faster-whisper，支持 CPU/GPU）。
 
 用法:
     python asr.py --video results/live.mp4 --out results/transcript.jsonl \
-        --model small --lang zh
+        --model small --lang zh --device auto
 
 输出 JSONL 每行（句级）:
     {"start": 12.3, "end": 15.1, "text": "...", "words": [[w, ws, we], ...]}
-words 为词级时间戳列表（词级可用时）。
 
-降级策略:
-    - 模型下载失败 / 无音频流 / 网络受限 -> 退出码 2，并在 stderr 明确说明。
-    - 下游 highlight_score.py 允许在没有转录时只用弹幕信号（w2=0）。
+设备选择:
+    - auto: 自动检测 (cuda > mps > cpu)
+    - cuda: NVIDIA GPU
+    - mps: Apple Silicon GPU
+    - cpu: CPU
 """
 import argparse
 import json
@@ -36,10 +37,23 @@ def extract_audio(video: Path, wav: Path) -> bool:
     return True
 
 
-def transcribe(wav: Path, model_size: str, lang: str):
+def get_auto_device():
+    """自动检测最佳可用设备。faster-whisper 不支持 MPS，回退 CPU。"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        # MPS not supported by faster-whisper 1.x — fall through to cpu
+    except ImportError:
+        pass
+    return "cpu"
+
+
+def transcribe(wav: Path, model_size: str, lang: str, device: str = "cpu"):
     """返回 segments 列表；模型下载失败抛异常由调用方处理。"""
     from faster_whisper import WhisperModel
-    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    compute_type = "float16" if device != "cpu" else "int8"
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
     segs, _info = model.transcribe(str(wav), language=lang,
                                    word_timestamps=True, vad_filter=True)
     out = []
@@ -57,7 +71,15 @@ def main():
     ap.add_argument("--out", default="results/transcript.jsonl")
     ap.add_argument("--model", default="small", help="tiny/base/small/medium")
     ap.add_argument("--lang", default="zh")
+    ap.add_argument("--device", default="auto",
+                    help="auto/cpu/cuda/mps (auto=自动检测)")
     args = ap.parse_args()
+
+    # 解析设备
+    device = args.device
+    if device == "auto":
+        device = get_auto_device()
+        print(f"[asr] Auto-selected device: {device}")
 
     video = Path(args.video)
     if not video.exists():
@@ -67,7 +89,7 @@ def main():
     if not extract_audio(video, wav):
         sys.exit(2)
     try:
-        segs = transcribe(wav, args.model, args.lang)
+        segs = transcribe(wav, args.model, args.lang, device=device)
     except Exception as e:
         print(f"[asr] 转录失败（可能是模型下载受限）: {e}", file=sys.stderr)
         sys.exit(2)
