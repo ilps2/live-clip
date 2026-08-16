@@ -60,7 +60,7 @@ img{max-width:100%;border-radius:14px;border:1px solid var(--border)}
   <p>让 LLM 读视频的<strong>信息层</strong>（几千 token），而不是逐帧像素（百万 token）。先低成本判断视频类型，自动选择最便宜且够用的理解策略。</p>
   <div class="stats">
     <div class="stat"><b>99.99%</b><span>token 降本（10 视频实测）</span></div>
-    <div class="stat"><b>0.034 元</b><span>单视频 LLM 成本（21min）</span></div>
+    <div class="stat"><b>0.008 元</b><span>单视频 LLM 成本（21min）</span></div>
     <div class="stat"><b>10/10</b><span>真实 B站视频理解成功</span></div>
   </div>
 </div>
@@ -120,7 +120,7 @@ img{max-width:100%;border-radius:14px;border:1px solid var(--border)}
   <div class="card">
     <p>2026-08 用自研下载器取 10 个真实 B站视频（8 类别 × 1~28 分钟 × 360p~1080p 多画质），完整跑 下载 → encode → classify → prompt → LLM。链路 <strong style="color:var(--success)">10/10 全部成功</strong>。</p>
     <table>
-      <tr><th>#</th><th>视频</th><th>类型</th><th>窗口</th><th>信息层 tok</th><th>原始逐帧 tok</th><th>降本</th></tr>
+      <tr><th>#</th><th>视频</th><th>类型</th><th>窗口</th><th>信息层 tok</th><th>原始逐帧 tok</th><th>token压缩</th></tr>
       <tr><td>1</td><td class="l">BJ黑珍舞蹈视频.mp4</td><td><span class="tag">motion_dense</span></td><td>150s</td><td class="num">926</td><td class="num dim">4,500,000</td><td class="num hl">99.98%</td></tr>
       <tr><td>2</td><td class="l">【2026】个人好物推荐分享ED</td><td><span class="tag">speech_dense</span></td><td>180s</td><td class="num">1,166</td><td class="num dim">5,400,000</td><td class="num hl">99.98%</td></tr>
       <tr><td>3</td><td class="l">【恐怖动画】五日安魂 第五集.m</td><td><span class="tag">motion_dense</span></td><td>78s</td><td class="num">643</td><td class="num dim">2,340,000</td><td class="num hl">99.97%</td></tr>
@@ -154,7 +154,8 @@ img{max-width:100%;border-radius:14px;border:1px solid var(--border)}
   <h2>五、成本对比（信息层 vs 原始逐帧）</h2>
   <div class="card">
     <img src="avis-cost-chart.png" alt="AVIS 成本对比图">
-    <p class="dim">21 分钟电影解说视频端到端：下载 + 分析 + 理解 220 秒，LLM 成本 0.034 元（含 3 个问答），降本 99.99%。</p>
+    <p class="dim">21 分钟电影解说视频端到端：下载 + 分析 + 理解 220 秒，LLM 成本 0.008 元（含 3 个问答），token 压缩 99.99%。</p>
+    <p class="dim" style="margin-top:12px">📐 <strong>核算口径</strong>：① LLM 成本按 <code>deepseek-chat</code>（实际路由 v4-flash）2026-08-17 调价后<strong>空闲时段</strong>价格：输入 1.5 元/百万 token、输出 4.5 元/百万 token；② 「token 压缩」= 信息层实际 token ÷ 原始逐帧估算 token（30fps × 1000 token/帧），是压缩率对比，非两家账单对比；③ 本地信号（MV/MOG2/whisper/YOLO）不计费，未计入电费与算力时间。</p>
   </div>
 </section>
 
@@ -173,7 +174,7 @@ img{max-width:100%;border-radius:14px;border:1px solid var(--border)}
 <section>
   <h2>七、分级成本路线 L0/L1/L2</h2>
   <div class="card">
-    <pre>L0 内容级（摘要/问答/分类/剪辑）→ 信息层，0.034 元/视频      ← 80% 需求在这
+    <pre>L0 内容级（摘要/问答/分类/剪辑）→ 信息层，0.008 元/视频      ← 80% 需求在这
 L1 视觉级（对象/事件细节）      → L0 + 按需抽 3-5 帧 + VLM
 L2 证据级（逐帧审查）           → 仅对 L0/L1 命中的可疑片段展开</pre>
     <p class="dim">常规需求的 80% 永远走 L0；只有真正需要画面细节才升级 —— 整体成本仍比「全部逐帧」低 2~3 个数量级。</p>
@@ -196,7 +197,7 @@ L2 证据级（逐帧审查）           → 仅对 L0/L1 命中的可疑片段�
     <pre>git clone git@github.com:ilps2/live-clip.git
 cd live-clip
 python3 understand_video.py "B站链接或BV号"
-# → 下载 → AVIS 分析 → 摘要 + 3 个问答，0.034 元，220 秒</pre>
+# → 下载 → AVIS 分析 → 摘要 + 3 个问答，0.008 元，220 秒</pre>
     <p><a href="https://github.com/ilps2/live-clip">github.com/ilps2/live-clip</a> —— 代码、数据、消融实验、成本图全部开源。</p>
   </div>
 </section>
