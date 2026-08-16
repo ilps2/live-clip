@@ -85,12 +85,16 @@ def calc_cost(usage):
     return cost, hit, miss
 
 def main():
-    ap = argparse.ArgumentParser(description="L0 一键视频理解")
+    ap = argparse.ArgumentParser(description="L0/L1/L2 视频理解（信息层 + 按需视觉帧）")
     ap.add_argument("target", help="B站 URL / BV 号 / 本地视频路径")
     ap.add_argument("--ask", action="append", default=[], help="自定义问题（可多次）")
     ap.add_argument("--no-download", action="store_true", help="target 为本地文件，跳过下载")
     ap.add_argument("--workdir", default="/tmp/avis_l0", help="工作目录")
     ap.add_argument("--json", action="store_true", help="输出 JSON（dsh 工具模式）")
+    ap.add_argument("--level", choices=["l0", "l1", "l2"], default="l0",
+                    help="l0=信息层(默认) l1=+3-5帧VLM视觉摘要 l2=+时间窗密集帧证据")
+    ap.add_argument("--l2-window", default="auto", help="L2 时间窗，如 10-30 或秒数（auto=轨迹最活跃30s）")
+    ap.add_argument("--l2-step", type=int, default=2, help="L2 抽帧步长（秒）")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -114,14 +118,37 @@ def main():
                      "-show_entries", "stream=duration", "-of", "csv=p=0", video_path]).stdout.strip() or 0)
     stats = token_stats(avis_dir, dur)
 
-    sys_msg = ("你是视频内容分析助手。基于给定的信息层（语音转写+场景结构+运动对象轨迹），"
-               "回答用户问题。直接给出答案，不要复述问题。信息不足时明确说明缺失什么，不要编造。")
+    # 3b. L1/L2 视觉级：按需抽帧 + VLM（补信息层盲区：颜色/姿态/衣着/文字/型号）
+    visual_note = ""
+    visual_cost = 0.0
+    if args.level in ("l1", "l2"):
+        print(f"👁️  L{args.level[1]} 视觉级：抽帧 + VLM（qwen3-vl-flash）...", flush=True)
+        vl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visual_level.py")
+        vl_cmd = [PY, vl, args.level, video_path, avis_dir, "--json"]
+        if args.level == "l2":
+            vl_cmd += ["--window", args.l2_window, "--step", str(args.l2_step)]
+        vr = run(vl_cmd)
+        try:
+            vd = json.loads(vr.stdout[vr.stdout.index("{"):])
+            desc = vd.get("description", "")
+            pin, pout = vd.get("tokens", {}).get("in", 0), vd.get("tokens", {}).get("out", 0)
+            # qwen3-vl-flash 价格（元/M，阿里云兼容）：输入 ~0.0002 输出 ~0.0007（量级，按官网近似）
+            visual_cost = pin / 1e6 * 0.2 + pout / 1e6 * 0.7
+            visual_note = (f"\n## 视觉补充（L{args.level[1]} VLM 抽帧描述，{vd.get('frames', [])}）\n"
+                           f"{desc}\n")
+            print(f"  ✅ 视觉描述 {len(desc)} 字 | VLM {pin}+{pout} tok ≈ {visual_cost:.4f} 元")
+        except Exception as e:
+            print(f"  ⚠️ 视觉级失败: {e}")
+
+    sys_msg = ("你是视频内容分析助手。基于给定的信息层（语音转写+场景结构+运动对象轨迹）"
+               + ("+视觉帧描述" if visual_note else "")
+               + "，回答用户问题。直接给出答案，不要复述问题。信息不足时明确说明缺失什么，不要编造。")
     print("🤖 LLM 摘要 + 问答...", flush=True)
     qs = args.ask or DEFAULT_QUESTIONS
     # 单次调用：信息层只进一次，多问题合并（省 ~60% 输入 token）
     q_block = "\n\n".join(f"问题{i + 1}: {q}" for i, q in enumerate(qs))
     msg, usage = llm([{"role": "system", "content": sys_msg},
-                      {"role": "user", "content": p + "\n\n" + q_block +
+                      {"role": "user", "content": p + visual_note + "\n\n" + q_block +
                        "\n\n请按 '问题N: 回答' 的格式逐条回答。"}], max_tokens=800)
     total_in = usage.get("prompt_tokens", 0)
     total_out = usage.get("completion_tokens", 0)
@@ -147,15 +174,17 @@ def main():
             "info_tokens": stats["info"],
             "orig_frame_tokens": stats["orig"],
             "token_compression_pct": stats["save"],
-            "cost_cny": round(cost, 5),
+            "cost_cny": round(cost + visual_cost, 5),
+            "visual_cost_cny": round(visual_cost, 5),
+            "level": args.level,
             "prompt_cache_hit_tokens": hit,
             "answers": [{"question": q, "answer": a} for q, a in zip(qs, answers)],
         }, ensure_ascii=False, indent=2))
         return
 
     print("=" * 70)
-    print(f"✅ 完成 | 视频 {dur:.0f}s | 耗时 {elapsed:.0f}s | 信息层 {stats['info']} tok vs 原始逐帧 {stats['orig']:,} tok | token 压缩 {stats['save']}%")
-    print(f"💵 LLM 成本 ≈ {cost:.4f} 元（v4-flash 空闲价：命中 {hit} tok({hit_pct:.0f}%) @0.05元/M + 未命中 {miss} tok @1.5元/M + 输出 {total_out} tok @4.5元/M）")
+    print(f"✅ 完成 | 视频 {dur:.0f}s | 耗时 {elapsed:.0f}s | 层级 {args.level.upper()} | 信息层 {stats['info']} tok vs 原始逐帧 {stats['orig']:,} tok | token 压缩 {stats['save']}%")
+    print(f"💵 成本 ≈ {cost + visual_cost:.4f} 元（LLM {cost:.4f} + 视觉 {visual_cost:.4f}；v4-flash 空闲价 + qwen3-vl-flash）")
     print(f"♻️  重复理解：同一视频再次理解时信息层 ~93% 命中缓存 → 每次 ≈ {cost/20:.4f}~{cost:.4f} 元（约为首次的 1/20）")
 
     # 保存报告
