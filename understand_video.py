@@ -43,15 +43,76 @@ def download(url_or_bv, outdir):
         raise SystemExit("下载后未找到 mp4")
     return mp4s[-1]
 
-def analyze(video_path, workdir):
-    """AVIS encode → avis_dir。"""
-    out = os.path.join(workdir, "avis_out")
+def analyze(video_path, workdir, asr_model="tiny", sub="avis_out"):
+    """AVIS encode → avis_dir。asr_model: tiny/base/small。"""
+    out = os.path.join(workdir, sub)
     os.makedirs(out, exist_ok=True)
-    r = run([PY, AVIS, "encode", video_path, "-o", out, "--obj-tracks", "--asr-model", "tiny"])
+    r = run([PY, AVIS, "encode", video_path, "-o", out, "--obj-tracks",
+             "--asr-model", asr_model, "--skip-mv"])
     if r.returncode != 0:
         raise SystemExit(f"encode 失败: {r.stderr[-400:]}")
     stem = os.path.splitext(os.path.basename(video_path))[0] + "_avis"
     return os.path.join(out, stem)
+
+def quality_check(question, answer):
+    """LLM 自评：回答对问题的信息充分度 0-10 + 缺口类型（轻量调用）。"""
+    body = {"model": "deepseek-chat",
+            "messages": [{"role": "system",
+                          "content": "你是严格的质量评估器。回答含「无法确认/识别错误/信息不足/不确定/可能/缺失」等表述时应给低分（<6）；"
+                          "用户问具体内容（物品/数量/价格/名称）时，回答缺少具体名称、数量、价格即为不足。"},
+                         {"role": "user",
+                          "content": f"用户问题: {question}\n模型回答: {answer[:600]}\n\n"
+                          "评估回答的信息充分度（0-10，<7 为不足，需要升级信号）和主要缺口"
+                          "（asr=语音转写不清/缺失, visual=缺画面细节, none=已充分, other=其他）。"
+                          "严格输出 JSON: {\"score\": 0-10, \"gap\": \"asr|visual|none|other\"}"}],
+            "max_tokens": 60, "temperature": 0}
+    req = urllib.request.Request(URL, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {KEY}"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        r = json.loads(resp.read())
+    raw = r["choices"][0]["message"]["content"]
+    try:
+        d = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+        return int(d.get("score", 0)), d.get("gap", "other")
+    except Exception:
+        return 0, "other"
+
+def run_visual(level, video, avis_dir, window=None):
+    """调 visual_level.py，返回 (note, cost)。"""
+    vl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visual_level.py")
+    cmd = [PY, vl, level, video, avis_dir, "--json"]
+    if level == "l2" and window:
+        cmd += ["--window", str(window), "--step", "5"]
+    vr = run(cmd)
+    try:
+        vd = json.loads(vr.stdout[vr.stdout.index("{"):])
+        desc = vd.get("description", "")
+        pin, pout = vd.get("tokens", {}).get("in", 0), vd.get("tokens", {}).get("out", 0)
+        cost = pin / 1e6 * 0.2 + pout / 1e6 * 0.7  # qwen3-vl-flash 近似
+        note = (f"\n## 视觉补充（L{level.upper()} VLM 抽帧描述，{vd.get('frames', [])}）\n{desc}\n")
+        print(f"  ✅ 视觉 {len(desc)} 字 | VLM {pin}+{pout} tok ≈ {cost:.4f} 元")
+        return note, cost
+    except Exception as e:
+        print(f"  ⚠️ 视觉级失败: {e}")
+        return "", 0.0
+
+def pick_key_window(avis_dir, dur):
+    """选 L2 关键窗：ASR 含价格/物品词的时段优先，否则轨迹最活跃 30s。"""
+    KEY_WORDS = ("欧", "元", "块", "个", "袋", "包", "面包", "甜", "硬", "买", "价", "钱", "€")
+    best_a, best_b, best_hits = 0, min(30, int(dur)), 0
+    tr = os.path.join(avis_dir, "transcript.jsonl")
+    if os.path.exists(tr):
+        segs = [json.loads(l) for l in open(tr, encoding="utf-8") if l.strip()]
+        # 滑窗 30s 统计关键词命中
+        for a in range(0, max(1, int(dur) - 29)):
+            hits = 0
+            for s in segs:
+                t = s.get("start", 0)
+                if a <= t < a + 30 and any(w in s.get("text", "") for w in KEY_WORDS):
+                    hits += 1
+            if hits > best_hits:
+                best_hits, best_a, best_b = hits, a, a + 30
+    return f"{best_a}-{best_b}"
 
 def token_stats(avis_dir, dur):
     tr, ot = os.path.join(avis_dir, "transcript.jsonl"), os.path.join(avis_dir, "obj_tracks.jsonl")
@@ -95,6 +156,9 @@ def main():
                     help="l0=信息层(默认) l1=+3-5帧VLM视觉摘要 l2=+时间窗密集帧证据")
     ap.add_argument("--l2-window", default="auto", help="L2 时间窗，如 10-30 或秒数（auto=轨迹最活跃30s）")
     ap.add_argument("--l2-step", type=int, default=2, help="L2 抽帧步长（秒）")
+    ap.add_argument("--auto", dest="auto", action="store_true", default=True,
+                    help="质量门控自动升级（默认开）：LLM 自评不足时自动 ASR tiny→base / L2 关键段帧")
+    ap.add_argument("--no-auto", dest="auto", action="store_false", help="关闭自动升级")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -108,65 +172,71 @@ def main():
         video_path = download(args.target, args.workdir)
     print(f"🎬 视频: {os.path.basename(video_path)}", flush=True)
 
-    # 2. AVIS 分析
+    # 2. AVIS 分析（L0：tiny ASR + 轨迹；质量不足时自动升级）
     print("🔍 AVIS 分析（MV/ASR/场景/物体轨迹 + YOLO 标签）...", flush=True)
-    avis_dir = analyze(video_path, args.workdir)
-
-    # 3. 信息层 → 摘要
-    p = run([PY, AVIS, "prompt", avis_dir]).stdout
+    avis_dir = analyze(video_path, args.workdir, asr_model="tiny", sub="avis_tiny")
     dur = float(run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                      "-show_entries", "stream=duration", "-of", "csv=p=0", video_path]).stdout.strip() or 0)
     stats = token_stats(avis_dir, dur)
 
-    # 3b. L1/L2 视觉级：按需抽帧 + VLM（补信息层盲区：颜色/姿态/衣着/文字/型号）
+    # 3. 质量门控循环：LLM 自评 → 不足自动升级（ASR base / L2 视觉）
+    qs = args.ask or DEFAULT_QUESTIONS
+    q_block = "\n\n".join(f"问题{i + 1}: {q}" for i, q in enumerate(qs))
+    asr_model = "tiny"
     visual_note = ""
     visual_cost = 0.0
-    if args.level in ("l1", "l2"):
-        print(f"👁️  L{args.level[1]} 视觉级：抽帧 + VLM（qwen3-vl-flash）...", flush=True)
-        vl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visual_level.py")
-        vl_cmd = [PY, vl, args.level, video_path, avis_dir, "--json"]
-        if args.level == "l2":
-            vl_cmd += ["--window", args.l2_window, "--step", str(args.l2_step)]
-        vr = run(vl_cmd)
-        try:
-            vd = json.loads(vr.stdout[vr.stdout.index("{"):])
-            desc = vd.get("description", "")
-            pin, pout = vd.get("tokens", {}).get("in", 0), vd.get("tokens", {}).get("out", 0)
-            # qwen3-vl-flash 价格（元/M，阿里云兼容）：输入 ~0.0002 输出 ~0.0007（量级，按官网近似）
-            visual_cost = pin / 1e6 * 0.2 + pout / 1e6 * 0.7
-            visual_note = (f"\n## 视觉补充（L{args.level[1]} VLM 抽帧描述，{vd.get('frames', [])}）\n"
-                           f"{desc}\n")
-            print(f"  ✅ 视觉描述 {len(desc)} 字 | VLM {pin}+{pout} tok ≈ {visual_cost:.4f} 元")
-        except Exception as e:
-            print(f"  ⚠️ 视觉级失败: {e}")
-
-    sys_msg = ("你是视频内容分析助手。基于给定的信息层（语音转写+场景结构+运动对象轨迹）"
-               + ("+视觉帧描述" if visual_note else "")
-               + "，回答用户问题。直接给出答案，不要复述问题。信息不足时明确说明缺失什么，不要编造。")
-    print("🤖 LLM 摘要 + 问答...", flush=True)
-    qs = args.ask or DEFAULT_QUESTIONS
-    # 单次调用：信息层只进一次，多问题合并（省 ~60% 输入 token）
-    q_block = "\n\n".join(f"问题{i + 1}: {q}" for i, q in enumerate(qs))
-    msg, usage = llm([{"role": "system", "content": sys_msg},
-                      {"role": "user", "content": p + visual_note + "\n\n" + q_block +
-                       "\n\n请按 '问题N: 回答' 的格式逐条回答。"}], max_tokens=800)
-    total_in = usage.get("prompt_tokens", 0)
-    total_out = usage.get("completion_tokens", 0)
-    cost, hit, miss = calc_cost(usage)
-    # 拆分段落到 answers
+    total_cost = 0.0
+    total_hit = total_miss = total_out = 0
+    rounds, upgrades = 0, []
     answers = []
-    for i, q in enumerate(qs, 1):
-        m = re.search(rf"问题{i}\s*[:：]\s*(.*?)(?=问题{i + 1}\s*[:：]|\Z)", msg, re.S)
-        answers.append(m.group(1).strip() if m else f"(未能拆分) {msg[:200]}")
-    for i, (q, a) in enumerate(zip(qs, answers), 1):
-        print(f"\n❓ Q{i} {q}\n💬 {a}\n", flush=True)
+
+    while True:
+        p = run([PY, AVIS, "prompt", avis_dir]).stdout
+        sys_msg = ("你是视频内容分析助手。基于给定的信息层（语音转写+场景结构+运动对象轨迹"
+                   + ("+视觉帧描述" if visual_note else "")
+                   + "），回答用户问题。直接给出答案，不要复述问题。信息不足时明确说明缺失什么，不要编造。")
+        print(f"🤖 LLM 回答（第 {rounds + 1} 轮，ASR={asr_model}）...", flush=True)
+        msg, usage = llm([{"role": "system", "content": sys_msg},
+                          {"role": "user", "content": p + visual_note + "\n\n" + q_block +
+                           "\n\n请按 '问题N: 回答' 的格式逐条回答。"}], max_tokens=800)
+        c, h, m = calc_cost(usage)
+        total_cost += c; total_hit += h; total_miss += m; total_out += usage.get("completion_tokens", 0)
+        answers = []
+        for i, q in enumerate(qs, 1):
+            mm = re.search(rf"问题{i}\s*[:：]\s*(.*?)(?=问题{i + 1}\s*[:：]|\Z)", msg, re.S)
+            answers.append(mm.group(1).strip() if mm else f"(未能拆分) {msg[:200]}")
+        for i, (q, a) in enumerate(zip(qs, answers), 1):
+            print(f"\n❓ Q{i} {q}\n💬 {a}\n", flush=True)
+
+        # 自评门控
+        if not args.auto or rounds >= 2:
+            break
+        score, gap = quality_check(qs[0], answers[0])
+        print(f"  [自评] 充分度 {score}/10 | 缺口: {gap} | 轮次 {rounds + 1}/3", flush=True)
+        if score >= 7:
+            break
+        # 升级决策
+        if gap == "visual" or (gap == "other" and asr_model == "base"):
+            window = pick_key_window(avis_dir, dur)
+            print(f"  ⬆️  升级 L2 视觉关键段（{window}s）...", flush=True)
+            note, vc = run_visual("l2", video_path, avis_dir, window)
+            visual_note = visual_note + note
+            visual_cost += vc
+            upgrades.append(f"L2@{window}")
+        else:  # asr / other → 升级 ASR
+            asr_model = "base"
+            print("  ⬆️  升级 ASR tiny→base 重转写...", flush=True)
+            avis_dir = analyze(video_path, args.workdir, asr_model="base", sub="avis_base")
+            stats = token_stats(avis_dir, dur)
+            upgrades.append("ASR:base")
+        rounds += 1
 
     # 4. 汇总
     elapsed = time.time() - t0
-    hit_pct = hit / total_in * 100 if total_in else 0
+    hit_pct = total_hit / (total_hit + total_miss) * 100 if (total_hit + total_miss) else 0
+    level_tag = args.level.upper() + ("+auto" if args.auto and upgrades else "")
 
     if args.json:
-        # dsh 工具模式：结构化输出
         print(json.dumps({
             "video": os.path.basename(video_path),
             "duration_s": round(dur),
@@ -174,18 +244,21 @@ def main():
             "info_tokens": stats["info"],
             "orig_frame_tokens": stats["orig"],
             "token_compression_pct": stats["save"],
-            "cost_cny": round(cost + visual_cost, 5),
+            "cost_cny": round(total_cost + visual_cost, 5),
             "visual_cost_cny": round(visual_cost, 5),
-            "level": args.level,
-            "prompt_cache_hit_tokens": hit,
+            "level": level_tag,
+            "rounds": rounds + 1,
+            "upgrades": upgrades,
+            "quality_scores": [],
+            "prompt_cache_hit_tokens": total_hit,
             "answers": [{"question": q, "answer": a} for q, a in zip(qs, answers)],
         }, ensure_ascii=False, indent=2))
         return
 
     print("=" * 70)
-    print(f"✅ 完成 | 视频 {dur:.0f}s | 耗时 {elapsed:.0f}s | 层级 {args.level.upper()} | 信息层 {stats['info']} tok vs 原始逐帧 {stats['orig']:,} tok | token 压缩 {stats['save']}%")
-    print(f"💵 成本 ≈ {cost + visual_cost:.4f} 元（LLM {cost:.4f} + 视觉 {visual_cost:.4f}；v4-flash 空闲价 + qwen3-vl-flash）")
-    print(f"♻️  重复理解：同一视频再次理解时信息层 ~93% 命中缓存 → 每次 ≈ {cost/20:.4f}~{cost:.4f} 元（约为首次的 1/20）")
+    print(f"✅ 完成 | 视频 {dur:.0f}s | 耗时 {elapsed:.0f}s | 层级 {level_tag} | 信息层 {stats['info']} tok vs 原始逐帧 {stats['orig']:,} tok | token 压缩 {stats['save']}%")
+    print(f"💵 成本 ≈ {total_cost + visual_cost:.4f} 元（LLM {total_cost:.4f} + 视觉 {visual_cost:.4f}）| 升级: {' → '.join(upgrades) if upgrades else '无'} | 缓存命中 {hit_pct:.0f}%")
+    print(f"♻️  重复理解：同一视频再次理解时信息层 ~93% 命中缓存 → 每次 ≈ {total_cost/20:.4f}~{total_cost:.4f} 元（约为首次的 1/20）")
 
     # 保存报告
     report = os.path.join(args.workdir, "report.md")
@@ -193,7 +266,8 @@ def main():
         f.write(f"# 视频理解报告\n\n- 视频: {os.path.basename(video_path)}\n- 时长: {dur:.0f}s\n")
         f.write(f"- 信息层: {stats['info']} tok (ASR {stats['asr']} + 轨迹 {stats['tracks']}×60 + 结构 150)\n")
         f.write(f"- 原始逐帧估算: {stats['orig']:,} tok → token 压缩 {stats['save']}%（核心指标，模型无关）\n")
-        f.write(f"- LLM 成本: {cost:.4f} 元（v4-flash 空闲价：缓存命中 {hit} tok + 未命中 {miss} tok + 输出 {total_out} tok）\n")
+        f.write(f"- LLM 成本: {total_cost:.4f} 元 + 视觉 {visual_cost:.4f} 元（缓存命中 {total_hit} tok + 未命中 {total_miss} tok + 输出 {total_out} tok）\n")
+        f.write(f"- 自动升级: {' → '.join(upgrades) if upgrades else '无（一轮达标）'}\n")
         f.write(f"- 重复理解: 同一视频再次理解时信息层 ~93% 命中上下文缓存 → 每次成本约为首次的 1/20\n\n")
         for i, (q, a) in enumerate(zip(args.ask or DEFAULT_QUESTIONS, answers), 1):
             f.write(f"## Q{i} {q}\n\n{a}\n\n")
