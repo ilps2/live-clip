@@ -32,8 +32,24 @@ def llm(messages, max_tokens=400):
         r = json.loads(resp.read())
     return r["choices"][0]["message"]["content"], r.get("usage", {})
 
+def fetch_title(url_or_bv):
+    """从 bilibili API 拿视频标题（标题类问题需要；本地文件返回文件名）。"""
+    try:
+        bv = re.search(r"BV[0-9A-Za-z]{10}", url_or_bv)
+        if bv:
+            import urllib.request as _ur
+            req = _ur.Request(f"{'https://api.bilibili.com/x/web-interface/view?bvid='}{bv.group(0)}",
+                headers={"User-Agent": "Mozilla/5.0"})
+            with _ur.urlopen(req, timeout=15) as resp:
+                d = json.loads(resp.read())
+            if d.get("code") == 0:
+                return d["data"].get("title", "")
+    except Exception:
+        pass
+    return ""
+
 def download(url_or_bv, outdir):
-    """B站下载（复用 bilibili-downloader skill 脚本，360p 快）。"""
+    """B站下载（复用 bilibili-downloader skill 脚本，360p 快）。返回 (path, title)。"""
     print(f"⬇️  下载 {url_or_bv} → 360p...", flush=True)
     r = run([PY, BILI, "download", url_or_bv, "--quality", "360", "-o", outdir])
     if r.returncode != 0:
@@ -41,7 +57,8 @@ def download(url_or_bv, outdir):
     mp4s = sorted(glob.glob(os.path.join(outdir, "*.mp4")), key=os.path.getmtime)
     if not mp4s:
         raise SystemExit("下载后未找到 mp4")
-    return mp4s[-1]
+    title = fetch_title(url_or_bv)
+    return mp4s[-1], title
 
 def analyze(video_path, workdir, asr_model="tiny", sub="avis_out"):
     """AVIS encode → avis_dir。asr_model: tiny/base/small。"""
@@ -167,10 +184,11 @@ def main():
     # 1. 获取视频文件
     if args.no_download:
         video_path = args.target
+        title = os.path.splitext(os.path.basename(video_path))[0]
         print(f"📂 本地文件: {video_path}")
     else:
-        video_path = download(args.target, args.workdir)
-    print(f"🎬 视频: {os.path.basename(video_path)}", flush=True)
+        video_path, title = download(args.target, args.workdir)
+    print(f"🎬 视频: {os.path.basename(video_path)}" + (f"（标题：{title}）" if title else ""), flush=True)
 
     # 2. AVIS 分析（L0：tiny ASR + 轨迹；质量不足时自动升级）
     print("🔍 AVIS 分析（MV/ASR/场景/物体轨迹 + YOLO 标签）...", flush=True)
@@ -188,10 +206,13 @@ def main():
     total_cost = 0.0
     total_hit = total_miss = total_out = 0
     rounds, upgrades = 0, []
+    used_windows = set()
     answers = []
 
     while True:
         p = run([PY, AVIS, "prompt", avis_dir]).stdout
+        if title:
+            p = f"# 视频标题：{title}\n（标题可能与内容不符，请结合内容判断）\n\n" + p
         sys_msg = ("你是视频内容分析助手。基于给定的信息层（语音转写+场景结构+运动对象轨迹"
                    + ("+视觉帧描述" if visual_note else "")
                    + "），回答用户问题。直接给出答案，不要复述问题。信息不足时明确说明缺失什么，不要编造。")
@@ -218,11 +239,22 @@ def main():
         # 升级决策
         if gap == "visual" or (gap == "other" and asr_model == "base"):
             window = pick_key_window(avis_dir, dur)
-            print(f"  ⬆️  升级 L2 视觉关键段（{window}s）...", flush=True)
-            note, vc = run_visual("l2", video_path, avis_dir, window)
-            visual_note = visual_note + note
-            visual_cost += vc
-            upgrades.append(f"L2@{window}")
+            # 去重：同窗口不重跑；换一个偏移窗口或改抽 ASR
+            if window in used_windows:
+                window = f"{int(window.split('-')[0]) + 30}-{int(window.split('-')[1]) + 30}"
+            if window in used_windows:
+                asr_model = "base"
+                print("  ⬆️  视觉窗口已用尽，改升级 ASR tiny→base...", flush=True)
+                avis_dir = analyze(video_path, args.workdir, asr_model="base", sub="avis_base")
+                stats = token_stats(avis_dir, dur)
+                upgrades.append("ASR:base")
+            else:
+                used_windows.add(window)
+                print(f"  ⬆️  升级 L2 视觉关键段（{window}s）...", flush=True)
+                note, vc = run_visual("l2", video_path, avis_dir, window)
+                visual_note = visual_note + note
+                visual_cost += vc
+                upgrades.append(f"L2@{window}")
         else:  # asr / other → 升级 ASR
             asr_model = "base"
             print("  ⬆️  升级 ASR tiny→base 重转写...", flush=True)
