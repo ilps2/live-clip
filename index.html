@@ -161,6 +161,21 @@ img{max-width:100%;border-radius:14px;border:1px solid var(--border)}
 </section>
 
 <section>
+  <h2>五·b、重复理解：一次编码，N 次复用，成本再降 95%</h2>
+  <div class="card">
+    <p>同一视频被反复理解（多次问答、多个模型、多个下游）时，AVIS 叠加<strong>上下文缓存</strong>进一步省钱：</p>
+    <table>
+      <tr><th>环节</th><th>首次</th><th>重复（第 2 次起）</th></tr>
+      <tr><td>本地信号提取（MV/ASR/YOLO）</td><td>免费（算力时间）</td><td class="hl">0（文件缓存，不重跑）</td></tr>
+      <tr><td>信息层 prompt（实测 1237 tok）</td><td>全价</td><td class="hl">93% 命中缓存 @0.05元/M</td></tr>
+      <tr><td>LLM 成本（21min 视频示例）</td><td>~0.006 元</td><td class="hl">~0.0003 元（约 1/20）</td></tr>
+    </table>
+    <p class="dim">机制：DeepSeek 上下文缓存按前缀命中 —— 信息层作为稳定前缀，换问题、换模型都命中；实测第 2 次起 1152/1237 tok 走缓存价（0.05 vs 1.5 元/M，便宜 30 倍）。</p>
+    <div class="tl">「一次编码、多方复用」的完整成本曲线：encode 一次（免费）→ 首次理解全价 → 之后每次 ≈ 1/20。视频库越大，摊销越低。</div>
+  </div>
+</section>
+
+<section>
   <h2>六、真实数据逼出的三个修复</h2>
   <div class="card">
     <h3>1. 场景边界误读</h3>
