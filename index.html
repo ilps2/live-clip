@@ -188,6 +188,20 @@ img{max-width:100%;border-radius:14px;border:1px solid var(--border)}
 </section>
 
 <section>
+  <h2>六·b、质量门控：当 LLM 说「信息不足」，系统自己升级</h2>
+  <div class="card">
+    <p>剩菜盲盒实测（8.5min 视频，问「博主买了什么剩菜盲盒」）——<strong>零人工干预</strong>：</p>
+    <table>
+      <tr><th>轮次</th><th>信号</th><th>LLM 自评</th><th>自动动作</th></tr>
+      <tr><td>1</td><td>tiny ASR</td><td>3/10 · 缺口 asr</td><td class="hl">⬆️ 自动升 base 重转写</td></tr>
+      <tr><td>2</td><td>base ASR</td><td>4/10 · 缺口 visual</td><td class="hl">⬆️ 自动 L2 关键段抽帧（价格词滑窗选段）</td></tr>
+      <tr><td>3</td><td>base + L2</td><td>达标</td><td>✅ 5.5欧 / 两个硬法棍 / 牛角包 / 甜甜糕点分类装袋</td></tr>
+    </table>
+    <p class="dim"><strong>成本 0.0181 元（3 轮封顶）</strong>。与 classify 分工：classify 是<strong>事前</strong>类型路由（选信号），质量门控是<strong>事后</strong>质量路由（判结果：LLM 自评充分度）——前者看信号特征，后者看 LLM 自己觉得够不够，两者互补。</p>
+  </div>
+</section>
+
+<section>
   <h2>七、分级成本路线 L0/L1/L2</h2>
   <div class="card">
     <pre>L0 内容级（摘要/问答/分类/剪辑）→ 信息层，0.008 元/视频      ← 80% 需求在这
