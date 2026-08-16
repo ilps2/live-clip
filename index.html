@@ -57,12 +57,13 @@ img{max-width:100%;border-radius:14px;border:1px solid var(--border)}
 <div class="hero">
   <div class="kicker">AVIS · INFORMATION LAYER</div>
   <h1>视频理解成本降 99.9%<br>给 LLM 一张「视频信息层」</h1>
-  <p>让 LLM 读视频的<strong>信息层</strong>（几千 token），而不是逐帧像素（百万 token）。先低成本判断视频类型，自动选择最便宜且够用的理解策略。</p>
+  <p>让 LLM 读视频的<strong>信息层</strong>（几千 token），而不是逐帧像素（百万 token）。先低成本判断视频类型，自动选择最便宜且够用的理解策略。<strong>核心指标是 token 压缩率</strong>——模型无关、随时段价格波动不变。</p>
   <div class="stats">
-    <div class="stat"><b>99.99%</b><span>token 降本（10 视频实测）</span></div>
-    <div class="stat"><b>0.008 元</b><span>单视频 LLM 成本（21min）</span></div>
+    <div class="stat"><b>99.95%+</b><span>token 压缩（10 视频实测）</span></div>
+    <div class="stat"><b>540万 → 1千</b><span>逐帧 token → 信息层 token</span></div>
     <div class="stat"><b>10/10</b><span>真实 B站视频理解成功</span></div>
   </div>
+  <p style="font-size:12.5px;opacity:.8;margin-top:16px">* 价格随模型/时段/缓存变化：按 deepseek-v4-flash 2026-08-17 调价空闲价，单视频约 <strong>0.008 元</strong>（示例价）。token 压缩率为模型无关的结构性指标。</p>
 </div>
 
 <section>
