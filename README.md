@@ -81,6 +81,19 @@ python3 understand_video.py /path/video.mp4 --no-download --ask "讲了什么" -
 - tiny ASR 错别字影响精确型号提取（可用 base/small）
 - 表情/纹理/OCR 等像素级细节需要多模态兜底（分级 L1/L2）
 
+## dsh 插件（DeepSeek Harness）
+
+`plugin/dsh-video-understand/` 是 dsh 插件：给 agent 注册 `video_understand` 工具（B站链接 → 摘要+问答，同上 token 压缩 99.95%+）。
+
+```bash
+# 安装（本地目录 file: 引用）
+# profile package.json dependencies 加:
+#   "dsh-video-understand": "file:/path/to/live-clip/plugin/dsh-video-understand"
+# bundles 加 "dsh-video-understand"，然后 pnpm install && dsh web
+```
+
+工具调用即跑本仓库的 `understand_video.py`（`VIDEO_UNDERSTAND_SCRIPT` 可配）。已在 web profile 实测：21min 视频 228s 出结果，token 压缩 99.99%，成本 0.006 元。
+
 ---
 
 # 原有功能：直播带货 AI 粗剪助手（v2.0）

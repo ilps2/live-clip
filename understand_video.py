@@ -90,6 +90,7 @@ def main():
     ap.add_argument("--ask", action="append", default=[], help="自定义问题（可多次）")
     ap.add_argument("--no-download", action="store_true", help="target 为本地文件，跳过下载")
     ap.add_argument("--workdir", default="/tmp/avis_l0", help="工作目录")
+    ap.add_argument("--json", action="store_true", help="输出 JSON（dsh 工具模式）")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -136,6 +137,22 @@ def main():
     # 4. 汇总
     elapsed = time.time() - t0
     hit_pct = hit / total_in * 100 if total_in else 0
+
+    if args.json:
+        # dsh 工具模式：结构化输出
+        print(json.dumps({
+            "video": os.path.basename(video_path),
+            "duration_s": round(dur),
+            "elapsed_s": round(elapsed),
+            "info_tokens": stats["info"],
+            "orig_frame_tokens": stats["orig"],
+            "token_compression_pct": stats["save"],
+            "cost_cny": round(cost, 5),
+            "prompt_cache_hit_tokens": hit,
+            "answers": [{"question": q, "answer": a} for q, a in zip(qs, answers)],
+        }, ensure_ascii=False, indent=2))
+        return
+
     print("=" * 70)
     print(f"✅ 完成 | 视频 {dur:.0f}s | 耗时 {elapsed:.0f}s | 信息层 {stats['info']} tok vs 原始逐帧 {stats['orig']:,} tok | token 压缩 {stats['save']}%")
     print(f"💵 LLM 成本 ≈ {cost:.4f} 元（v4-flash 空闲价：命中 {hit} tok({hit_pct:.0f}%) @0.05元/M + 未命中 {miss} tok @1.5元/M + 输出 {total_out} tok @4.5元/M）")
