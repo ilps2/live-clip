@@ -37,7 +37,7 @@ python3 understand_video.py /path/video.mp4 --no-download --ask "讲了什么" -
 | `avis.py classify <video> --asr` | 类型路由（帧差+色彩+ASR+MV 码流，零模型成本） |
 | `avis.py encode --obj-tracks` | 一次编码提取全部信号（MV/ASR/场景/YOLO 轨迹） |
 | `avis.py prompt <avis_dir>` | 融合提示词（视频 RAG，模型无关） |
-| `understand_video.py` | L0/L1/L2 分级理解：B站/本地 → 摘要 + 问答 + 成本报告（`--level l1` 加视觉帧） |
+| `understand_video.py` | L0/L1/L2 分级理解 + **质量门控自动升级**：LLM 自评不足时自动 ASR base / L2 关键段帧（`--no-auto` 关闭） |
 | `visual_level.py` | L1/L2 视觉级：按需抽帧 + VLM（qwen3-vl-flash），补颜色/姿态/衣着/文字盲区 |
 
 ## 验证数据
