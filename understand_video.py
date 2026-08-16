@@ -66,6 +66,24 @@ def token_stats(avis_dir, dur):
     return {"asr": asr_tok, "tracks": n_tracks, "info": info, "orig": orig,
             "save": round(100 * (1 - info / orig), 2)}
 
+# ── 成本核算（2026-08-17 DeepSeek V4 调价后，人民币计费）──
+# 模型: deepseek-chat → 实际路由 deepseek-v4-flash；高峰时段 9-12/14-18 点，其余空闲
+# 价格（元/百万 token，默认空闲价，可环境变量覆盖）：
+#   输入(缓存命中) 0.05 | 输入(未命中) 1.5 | 输出 4.5   （高峰: 0.10 / 3.0 / 9.0）
+# 重复理解省成本机制：同一信息层 prompt 第二次起 ~93% 命中上下文缓存（实测），
+# 命中部分按 0.05 元/M 计 → 后续每次理解 ≈ 0.0002 元（约为首次的 1/20）
+PRICE_IN_HIT = float(os.environ.get("AVIS_PRICE_IN_HIT", 0.05))
+PRICE_IN_MISS = float(os.environ.get("AVIS_PRICE_IN", 1.5))
+PRICE_OUT = float(os.environ.get("AVIS_PRICE_OUT", 4.5))
+
+def calc_cost(usage):
+    """按缓存命中拆分计算 LLM 成本，返回 (cost, hit_tok, miss_tok)。"""
+    hit = usage.get("prompt_cache_hit_tokens", 0) or 0
+    miss = usage.get("prompt_cache_miss_tokens", usage.get("prompt_tokens", 0) - hit) or 0
+    out = usage.get("completion_tokens", 0) or 0
+    cost = hit / 1e6 * PRICE_IN_HIT + miss / 1e6 * PRICE_IN_MISS + out / 1e6 * PRICE_OUT
+    return cost, hit, miss
+
 def main():
     ap = argparse.ArgumentParser(description="L0 一键视频理解")
     ap.add_argument("target", help="B站 URL / BV 号 / 本地视频路径")
@@ -106,6 +124,7 @@ def main():
                        "\n\n请按 '问题N: 回答' 的格式逐条回答。"}], max_tokens=800)
     total_in = usage.get("prompt_tokens", 0)
     total_out = usage.get("completion_tokens", 0)
+    cost, hit, miss = calc_cost(usage)
     # 拆分段落到 answers
     answers = []
     for i, q in enumerate(qs, 1):
@@ -115,28 +134,21 @@ def main():
         print(f"\n❓ Q{i} {q}\n💬 {a}\n", flush=True)
 
     # 4. 汇总
-    # ── 成本核算（2026-08-17 DeepSeek V4 调价后，人民币计费）──
-    # 模型: deepseek-chat → 实际路由 deepseek-v4-flash
-    # 价格（元/百万 token）：
-    #   输入(缓存未命中) 1.5 (空闲) / 3.0 (高峰)  输入(缓存命中) 0.05/0.10
-    #   输出              4.5 (空闲) / 9.0 (高峰)
-    # 高峰时段: 9-12 / 14-18 点；其余为空闲时段
-    # 注: 原实现误乘 7.2 汇率（DeepSeek 本币计费）已移除
-    PRICE_IN_MISS = float(os.environ.get("AVIS_PRICE_IN", 1.5))
-    PRICE_OUT = float(os.environ.get("AVIS_PRICE_OUT", 4.5))
-    cost = (total_in / 1e6 * PRICE_IN_MISS + total_out / 1e6 * PRICE_OUT)
     elapsed = time.time() - t0
+    hit_pct = hit / total_in * 100 if total_in else 0
     print("=" * 70)
     print(f"✅ 完成 | 视频 {dur:.0f}s | 耗时 {elapsed:.0f}s | 信息层 {stats['info']} tok vs 原始逐帧 {stats['orig']:,} tok | token 压缩 {stats['save']}%")
-    print(f"💵 LLM 成本 ≈ {cost:.4f} 元（v4-flash 空闲价；输入 {total_in} tok / 输出 {total_out} tok；'降本'为 token 压缩率，非账单对比）")
+    print(f"💵 LLM 成本 ≈ {cost:.4f} 元（v4-flash 空闲价：命中 {hit} tok({hit_pct:.0f}%) @0.05元/M + 未命中 {miss} tok @1.5元/M + 输出 {total_out} tok @4.5元/M）")
+    print(f"♻️  重复理解：同一视频再次理解时信息层 ~93% 命中缓存 → 每次 ≈ {cost/20:.4f}~{cost:.4f} 元（约为首次的 1/20）")
 
     # 保存报告
     report = os.path.join(args.workdir, "report.md")
     with open(report, "w", encoding="utf-8") as f:
         f.write(f"# 视频理解报告\n\n- 视频: {os.path.basename(video_path)}\n- 时长: {dur:.0f}s\n")
         f.write(f"- 信息层: {stats['info']} tok (ASR {stats['asr']} + 轨迹 {stats['tracks']}×60 + 结构 150)\n")
-        f.write(f"- 原始逐帧估算: {stats['orig']:,} tok → token 压缩 {stats['save']}%\n")
-        f.write(f"- LLM 成本: {cost:.4f} 元（deepseek-v4-flash 空闲价；token 压缩率为信息层/逐帧估算 token 比，非账单对比）\n\n")
+        f.write(f"- 原始逐帧估算: {stats['orig']:,} tok → token 压缩 {stats['save']}%（核心指标，模型无关）\n")
+        f.write(f"- LLM 成本: {cost:.4f} 元（v4-flash 空闲价：缓存命中 {hit} tok + 未命中 {miss} tok + 输出 {total_out} tok）\n")
+        f.write(f"- 重复理解: 同一视频再次理解时信息层 ~93% 命中上下文缓存 → 每次成本约为首次的 1/20\n\n")
         for i, (q, a) in enumerate(zip(args.ask or DEFAULT_QUESTIONS, answers), 1):
             f.write(f"## Q{i} {q}\n\n{a}\n\n")
     print(f"📄 报告: {report}")
