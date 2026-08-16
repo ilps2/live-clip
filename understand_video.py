@@ -239,7 +239,7 @@ def main():
         # 升级决策
         if gap == "visual" or (gap == "other" and asr_model == "base"):
             window = pick_key_window(avis_dir, dur)
-            # 去重：同窗口不重跑；换一个偏移窗口或改抽 ASR
+            # 去重：同窗口不重跑；换一个偏移窗口
             if window in used_windows:
                 window = f"{int(window.split('-')[0]) + 30}-{int(window.split('-')[1]) + 30}"
             if window in used_windows:
@@ -255,7 +255,18 @@ def main():
                 visual_note = visual_note + note
                 visual_cost += vc
                 upgrades.append(f"L2@{window}")
-        else:  # asr / other → 升级 ASR
+        elif gap == "asr" and asr_model == "base":
+            # base 转写仍不足 → 语音信息有限，转视觉关键段
+            window = pick_key_window(avis_dir, dur)
+            if window in used_windows:
+                window = f"{int(window.split('-')[0]) + 30}-{int(window.split('-')[1]) + 30}"
+            used_windows.add(window)
+            print(f"  ⬆️  base ASR 仍不足，转 L2 视觉关键段（{window}s）...", flush=True)
+            note, vc = run_visual("l2", video_path, avis_dir, window)
+            visual_note = visual_note + note
+            visual_cost += vc
+            upgrades.append(f"L2@{window}")
+        else:  # asr / other → 升级 ASR（tiny→base）
             asr_model = "base"
             print("  ⬆️  升级 ASR tiny→base 重转写...", flush=True)
             avis_dir = analyze(video_path, args.workdir, asr_model="base", sub="avis_base")
