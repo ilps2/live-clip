@@ -83,7 +83,7 @@ python3 understand_video.py /path/video.mp4 --no-download --ask "讲了什么" -
 
 ## dsh 插件（DeepSeek Harness）
 
-`plugin/dsh-video-understand/` 是 dsh 插件：给 agent 注册 `video_understand` 工具（B站链接 → 摘要+问答，同上 token 压缩 99.95%+）。
+[dsh-video-understand](https://github.com/ilps2/dsh-video-understand) 是 dsh 插件（独立 repo，topics: dsh/plugin/avis）：给 agent 注册 `video_understand` 工具（B站链接 → 摘要+问答，同上 token 压缩 99.95%+）。
 
 ```bash
 # 安装（本地目录 file: 引用）
