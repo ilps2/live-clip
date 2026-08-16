@@ -117,6 +117,25 @@ img{max-width:100%;border-radius:14px;border:1px solid var(--border)}
 </section>
 
 <section>
+  <h2>二·b、架构 v2：语义层 + 问题驱动定位（懒加载）</h2>
+  <div class="card">
+    <p>架构从「一次信息层 → LLM」演进为「<strong>语义层缓存 + 带着问题找答案</strong>」：</p>
+    <pre>┌─────────────── 语义层（一次编码，按视频缓存）───────────────┐
+│  MV码流 · tiny/base ASR · 场景 · 轨迹 · YOLO · [CLIP视觉索引]  │
+└──────────────────────────────────────────────────────────────┘
+        ↑ 同视频二次提问：缓存命中，零重新提取（已验证）
+
+用户问题 ─→ ① 定位器（读语义层全文，语义定位答案窗口+缺口）
+         ─→ ② 聚焦（只在窗口花成本：局部 base 重转写 / L2 抽帧）
+         ─→ ③ LLM 回答 + 质量自评（不足 → 再聚焦，3 轮封顶）
+         ─→ ④ suggest_layer？→ 用户决定是否建完整层（base+CLIP）
+              ├─ 建 → 后续任何问题秒答（缓存）
+              └─ 不建 → 结束，只花最小成本（一次性用户不为多轮买单）</pre>
+    <div class="tl"><strong>懒加载原则</strong>：首次提问只建最小索引（tiny，定位必需）；完整语义层（base 全量 + CLIP）由用户按需决定——一次性查询不白建厚层，多轮查询建一次层后每问 ≈0.002 元。</div>
+  </div>
+</section>
+
+<section>
   <h2>三、10 个真实 B站视频端到端实测</h2>
   <div class="card">
     <p>2026-08 用自研下载器取 10 个真实 B站视频（8 类别 × 1~28 分钟 × 360p~1080p 多画质），完整跑 下载 → encode → classify → prompt → LLM。链路 <strong style="color:var(--success)">10/10 全部成功</strong>。</p>
