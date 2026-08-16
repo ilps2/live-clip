@@ -539,6 +539,13 @@ def extract_obj_tracks(video_path: Path, avis_dir: Path, fps_target: int = 5,
         print("  ⚠️ obj_tracks: opencv not installed — skipping")
         return 0
 
+    def _scaled_frame(frame):
+        """Scale full frame to width 640 for YOLO."""
+        h, w = frame.shape[:2]
+        nw = 640
+        nh = max(1, int(h * nw / w))
+        return cv2.resize(frame, (nw, nh))
+
     print("\n[obj_tracks] Detecting motion objects (MOG2 + IoU tracking)...")
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -598,6 +605,10 @@ def extract_obj_tracks(video_path: Path, avis_dir: Path, fps_target: int = 5,
                 tr['last_bbox'] = d[:4]
                 tr['last_t'] = t
                 tr['missed'] = 0
+                if tr.get('snap_frame') is None:  # save first full frame (scaled) for YOLO
+                    tr['snap_frame'] = _scaled_frame(frame)
+                    tr['snap_bbox'] = d[:4]
+                    tr['orig_w'] = frame.shape[1]
             else:
                 tr['missed'] += 1
         for di, d in enumerate(dets):
@@ -607,9 +618,51 @@ def extract_obj_tracks(video_path: Path, avis_dir: Path, fps_target: int = 5,
                 break
             tracks.append({'id': next_id, 'appear_t': t, 'last_t': t,
                            'frames': [[round(t, 2), d[0], d[1], d[2], d[3], d[4], d[5]]],
-                           'last_bbox': d[:4], 'missed': 0})
+                           'last_bbox': d[:4], 'missed': 0,
+                           'snap_frame': _scaled_frame(frame), 'snap_bbox': d[:4],
+                           'orig_w': frame.shape[1]})
             next_id += 1
     cap.release()
+
+    # ── YOLO semantic labels (person/car/...) for motion objects ──
+    _yolo = None
+
+    def _yolo_model():
+        nonlocal _yolo
+        if _yolo is None:
+            _yolo = False
+            try:
+                from ultralytics import YOLO
+                for cand in (BASE / "models" / "yolov8n.pt",
+                             Path("/tmp/yolov8n.pt"), Path.home() / ".cache" / "yolov8n.pt"):
+                    if cand.exists():
+                        _yolo = YOLO(str(cand), verbose=False)
+                        break
+            except Exception as e:
+                print(f"  ⚠️ YOLO unavailable: {e}")
+        return _yolo or None
+
+    def _label_frame(snap_frame, snap_bbox, orig_w, orig_h):
+        """YOLO on full scaled frame; pick detection with max IoU to the blob bbox."""
+        m = _yolo_model()
+        if m is None or snap_frame is None or snap_frame.size == 0:
+            return None
+        try:
+            r = m(snap_frame, verbose=False, conf=0.25, imgsz=640)
+            if not r or r[0].boxes is None or len(r[0].boxes) == 0:
+                return None
+            scale = snap_frame.shape[1] / orig_w
+            bx, by, bw, bh = [v * scale for v in snap_bbox]
+            best_name, best_iou = None, 0.25
+            for b in r[0].boxes:
+                x1, y1, x2, y2 = [float(v) for v in b.xyxy[0]]
+                iou = _bbox_iou([bx, by, bx + bw, by + bh], [x1, y1, x2 - x1, y2 - y1])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_name = m.names[int(b.cls)]
+            return best_name
+        except Exception:
+            return None
 
     objs = []
     for tr in tracks:
@@ -627,7 +680,7 @@ def extract_obj_tracks(video_path: Path, avis_dir: Path, fps_target: int = 5,
         if len(pts) > 30:
             idx = [int(i * (len(pts) - 1) / 29) for i in range(30)]
             pts = [pts[i] for i in idx]
-        objs.append({
+        obj = {
             'obj_id': tr['id'],
             'appear_t': round(tr['appear_t'], 1),
             'disappear_t': round(tr['last_t'], 1),
@@ -636,7 +689,9 @@ def extract_obj_tracks(video_path: Path, avis_dir: Path, fps_target: int = 5,
             'motion': motion,
             'speed_px_s': round(speed, 1),
             'centroid_path': [[f[0], f[5], f[6]] for f in pts],
-        })
+        }
+        obj['class'] = _label_frame(tr.get('snap_frame'), tr.get('snap_bbox'), tr.get('orig_w', 1), 0) or 'unknown'
+        objs.append(obj)
 
     objs.sort(key=lambda o: o['appear_t'])
     if len(objs) > max_objects:
@@ -743,6 +798,20 @@ def classify_video(video_path: Path, use_asr: bool = False):
                           for seg in segs if seg.get("text", "").strip())
             speech_ratio = min(1.0, covered / dur if dur > 0 else 0)
             print(f"  [classify] ASR: {len(segs)} segments, speech coverage {speech_ratio*100:.0f}%")
+            # tiny empty → retry base once（避免把语音视频误判为 motion_dense）
+            if speech_ratio == 0.0:
+                print("  [classify] tiny ASR empty — retrying with base...")
+                try:
+                    r = run([sys.executable, str(BASE / "livestream-highlight" / "asr.py"),
+                             "--video", str(video_path), "--out", str(tr),
+                             "--model", "base", "--device", "auto"], desc="ASR retry", timeout=1200)
+                    segs = [_json.loads(l) for l in tr.read_text(encoding="utf-8").splitlines() if l.strip()]
+                    covered = sum(min(seg.get("end", seg.get("start", 0) + 1), dur) - seg.get("start", 0)
+                                  for seg in segs if seg.get("text", "").strip())
+                    speech_ratio = min(1.0, covered / dur if dur > 0 else 0)
+                    print(f"  [classify] retry(base): {len(segs)} segments, coverage {speech_ratio*100:.0f}%")
+                except Exception as e:
+                    print(f"  ⚠️ ASR retry failed: {e}")
 
     # routing
     type_ = "mixed"
@@ -825,8 +894,21 @@ def build_fused_prompt(avis_dir: Path, with_tracks: bool = True) -> str:
         rows = [l.strip() for l in sc_path.read_text(encoding="utf-8").splitlines()
                 if l.strip() and not l.strip().lower().startswith("sec,")]
         if rows:
-            parts.append("## 结构（场景分类）")
-            parts.append(f"- 场景边界 {len(rows)} 个：{', '.join(rows[:12])}")
+            # rows = "sec,scene" per-second labels → real boundaries + distribution
+            import collections
+            labels = [r.split(",")[1].strip() for r in rows if "," in r]
+            dist = collections.Counter(labels)
+            dist_s = ", ".join(f"{k} {v/len(labels)*100:.0f}%" for k, v in dist.most_common())
+            # boundary = scene changes, merged if < min_gap(2s) — mirrors SceneClassifier.boundaries
+            bounds = []
+            for i in range(1, len(labels)):
+                if labels[i] != labels[i - 1]:
+                    if not bounds or i - bounds[-1] >= 2:
+                        bounds.append(i)
+            bstr = ", ".join(f"{t}s" for t in bounds[:15]) + ("…" if len(bounds) > 15 else "")
+            parts.append("## 结构（场景分类，逐秒标签）")
+            parts.append(f"- 时长 {len(labels)}s | **{len(bounds)} 个场景边界** @ {bstr or '无'}")
+            parts.append(f"- 场景分布: {dist_s}")
             parts.append("")
 
     # obj_tracks
@@ -835,13 +917,15 @@ def build_fused_prompt(avis_dir: Path, with_tracks: bool = True) -> str:
         if trk_path.exists():
             objs = [json.loads(l) for l in trk_path.read_text(encoding="utf-8").splitlines() if l.strip()]
             if objs:
-                parts.append("## 谁在动（运动对象轨迹）")
+                parts.append("## 谁在动（运动对象轨迹 + YOLO 类别）")
                 for o in objs[:30]:
                     path_pts = o.get("centroid_path", [])
                     start = path_pts[0] if path_pts else []
                     end = path_pts[-1] if path_pts else []
+                    cls = o.get("class")
+                    cls_s = f" ({cls})" if cls and cls != "unknown" else ""
                     parts.append(
-                        f"- 对象#{o.get('obj_id')} [{o.get('appear_t')}s→{o.get('disappear_t')}s] "
+                        f"- 对象#{o.get('obj_id')}{cls_s} [{o.get('appear_t')}s→{o.get('disappear_t')}s] "
                         f"运动:{o.get('motion')} 速度:{o.get('speed_px_s')}px/s "
                         f"起({start[1] if len(start)>1 else '?'},{start[2] if len(start)>2 else '?'}) "
                         f"止({end[1] if len(end)>1 else '?'},{end[2] if len(end)>2 else '?'})"
@@ -938,6 +1022,19 @@ def encode_video(video_path: Path, output_dir: Path = None,
         segs = [json.loads(l) for l in open(transcript_path)]
         n_segs = len(segs)
     print(f"  {n_segs} segments")
+
+    # ASR empty → retry with a larger model once (tiny/base 对嘈杂/音乐背景人声可能 0 段)
+    if n_segs == 0 and asr_model != "small":
+        retry_model = {"tiny": "base", "base": "small"}.get(asr_model, "small")
+        print(f"  ⚠ ASR empty with {asr_model} — retrying with {retry_model}...")
+        r = run([sys.executable, str(BASE / "livestream-highlight" / "asr.py"),
+                 "--video", str(video), "--out", str(transcript_path),
+                 "--model", retry_model, "--device", asr_device], desc="ASR retry", timeout=1200)
+        if transcript_path.exists():
+            segs = [json.loads(l) for l in open(transcript_path)]
+            n_segs = len(segs)
+            asr_model = retry_model  # manifest 记录实际生效模型
+        print(f"  retry: {n_segs} segments")
 
     # --- Step 4: Scene classification ---
     scenes_path = avis_dir / "scenes.csv"
