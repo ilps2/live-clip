@@ -202,6 +202,21 @@ img{max-width:100%;border-radius:14px;border:1px solid var(--border)}
 </section>
 
 <section>
+  <h2>六·c、四个真实案例：从全量升级到问题驱动</h2>
+  <div class="card">
+    <table>
+      <tr><th>案例</th><th>视频</th><th>问题</th><th>自动流程</th><th>耗时</th><th>成本</th><th>结果</th></tr>
+      <tr><td><strong>剩菜盲盒</strong></td><td>8.5min</td><td>买了什么盲盒</td><td>tiny→base→L2关键段</td><td>204s</td><td>0.0181 元</td><td>✅ 5.5欧/硬法棍/牛角包/甜甜糕点</td></tr>
+      <tr><td><strong>发现龙穴</strong></td><td>11.4min</td><td>标题什么意思</td><td>tiny→L2（标题进prompt）</td><td>172s</td><td>0.0143 元</td><td>✅ 标题党实锤（横幅证据）</td></tr>
+      <tr><td><strong>火锅·全量版</strong></td><td>21.5min</td><td>点了哪些荤菜</td><td>tiny→base→base(重复bug)</td><td>799s</td><td>0.0167 元</td><td>⚠️ 需人工补跑</td></tr>
+      <tr><td><strong>火锅·问题驱动</strong></td><td>21.5min</td><td>点了哪些荤菜</td><td>定位→base局部→L2菜单特写</td><td><strong>314s</strong></td><td><strong>0.0125 元</strong></td><td>✅ 牛肉/鸡肉/毛肚/老鹅蹄花，零人工</td></tr>
+    </table>
+    <div class="tl"><strong>演进：</strong>三个案例逼出「问题驱动定位」——带着问题找答案：LLM 定位器语义定位答案窗口（荤菜→菜单段），只花关键窗口成本（局部 base 重转写 36 段 96s vs 全量 8-10min）。火锅视频从 <strong>799s/需人工 → 314s/零人工</strong>，成本还降 25%。</div>
+    <p class="dim">四维评分（问题驱动版）：<strong>速度 8/10（314s）· 准确 9/10 · token 10/10（0.0125 元）· 人工 10/10 = 37/40</strong>。全部案例 token 压缩 99.99%。</p>
+  </div>
+</section>
+
+<section>
   <h2>七、分级成本路线 L0/L1/L2</h2>
   <div class="card">
     <pre>L0 内容级（摘要/问答/分类/剪辑）→ 信息层，0.008 元/视频      ← 80% 需求在这
