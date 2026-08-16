@@ -37,7 +37,8 @@ python3 understand_video.py /path/video.mp4 --no-download --ask "讲了什么" -
 | `avis.py classify <video> --asr` | 类型路由（帧差+色彩+ASR+MV 码流，零模型成本） |
 | `avis.py encode --obj-tracks` | 一次编码提取全部信号（MV/ASR/场景/YOLO 轨迹） |
 | `avis.py prompt <avis_dir>` | 融合提示词（视频 RAG，模型无关） |
-| `understand_video.py` | L0 一键理解：B站/本地 → 摘要 + 问答 + 成本报告 |
+| `understand_video.py` | L0/L1/L2 分级理解：B站/本地 → 摘要 + 问答 + 成本报告（`--level l1` 加视觉帧） |
+| `visual_level.py` | L1/L2 视觉级：按需抽帧 + VLM（qwen3-vl-flash），补颜色/姿态/衣着/文字盲区 |
 
 ## 验证数据
 
@@ -74,12 +75,22 @@ python3 understand_video.py /path/video.mp4 --no-download --ask "讲了什么" -
 - **模型**（whisper tiny/base + yolov8n）：hf-mirror.com + gh-proxy 国内镜像自动下载（实测 4~6 秒）
 - 离线分发可选：模型离线包（夸克网盘，199M）——需要时联系维护者
 
+## 分级成本路线（L0/L1/L2 全部已实现）
+
+```
+L0 内容级（摘要/问答/分类/剪辑）→ 信息层，~0.006 元/视频     ← 80% 需求（understand_video.py 默认）
+L1 视觉级（画面细节）           → L0 + 3-5 帧 VLM，+0.0005 元（--level l1）
+  实测：电影解说补出「白色立领衬衫/神情凝重/暗色调诊室」——L0 完全给不出
+L2 证据级（时间窗逐帧）         → 指定窗口密集帧时间线（--level l2）
+  实测：舞蹈视频逐帧「头部转 15-20°→45°、口型开口→闭合→微笑」
+```
+
 ## 已知边界（诚实说明）
 
 - MOG2 轨迹在 360p 低清/镜头跟随下碎片化（person 召回 5/12），1080p 源效果更好
-- YOLO 仅 COCO 80 类，专业对象（食物/型号）仍 unknown
+- YOLO 仅 COCO 80 类，专业对象（食物/型号）仍 unknown（L1 视觉帧可补）
 - tiny ASR 错别字影响精确型号提取（可用 base/small）
-- 表情/纹理/OCR 等像素级细节需要多模态兜底（分级 L1/L2）
+- L1/L2 视觉帧覆盖抽帧时刻，极端细节（连续动作全貌）仍需更高帧率
 
 ## dsh 插件（DeepSeek Harness）
 
