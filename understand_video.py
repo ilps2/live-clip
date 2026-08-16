@@ -76,6 +76,40 @@ def encode(video_path, workdir, asr_model="tiny", sub="avis_tiny"):
     stem = os.path.splitext(os.path.basename(video_path))[0] + "_avis"
     return os.path.join(out, stem)
 
+def encode_cached(video_path, workdir, asr_model="tiny", use_clip=False):
+    """带缓存的 encode：按视频 hash 分层缓存（tiny/base/base+clip）。
+    同一视频二次调用命中缓存，跳过重新提取（语义层复用）。"""
+    import hashlib
+    st = os.stat(video_path)
+    h = hashlib.md5(f"{video_path}:{st.st_size}:{int(st.st_mtime)}".encode()).hexdigest()[:10]
+    tag = asr_model + ("_clip" if use_clip else "")
+    cache_dir = os.path.join(workdir, "avis_cache", h, tag)
+    stem = os.path.splitext(os.path.basename(video_path))[0] + "_avis"
+    avis_dir = os.path.join(cache_dir, stem)
+    if os.path.exists(os.path.join(avis_dir, "avis.json")):
+        print(f"♻️  语义层缓存命中: {tag}（{os.path.basename(cache_dir)}）", flush=True)
+        return avis_dir, h
+    os.makedirs(cache_dir, exist_ok=True)
+    cmd = [PY, AVIS, "encode", video_path, "-o", cache_dir, "--obj-tracks",
+           "--asr-model", asr_model, "--skip-mv"]
+    if use_clip:
+        cmd.append("--clip")
+    r = run(cmd)
+    if r.returncode != 0:
+        raise SystemExit(f"encode 失败: {r.stderr[-400:]}")
+    print(f"✅ {tag} 语义层已构建并缓存", flush=True)
+    return avis_dir, h
+
+def layer_cache_status(video_path, workdir):
+    """检查视频已有哪些语义层缓存。返回 (has_tiny, has_full)。"""
+    import hashlib
+    st = os.stat(video_path)
+    h = hashlib.md5(f"{video_path}:{st.st_size}:{int(st.st_mtime)}".encode()).hexdigest()[:10]
+    base = os.path.join(workdir, "avis_cache", h)
+    has_tiny = os.path.exists(os.path.join(base, "tiny"))
+    has_full = os.path.exists(os.path.join(base, "base_clip"))
+    return has_tiny, has_full
+
 def load_transcript(avis_dir):
     tr = os.path.join(avis_dir, "transcript.jsonl")
     segs = []
@@ -197,6 +231,9 @@ def main():
     ap.add_argument("--workdir", default="/tmp/avis_qd", help="工作目录")
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     ap.add_argument("--max-rounds", type=int, default=3, help="最多轮次（定位聚焦循环）")
+    ap.add_argument("--ask-layer", action="store_true",
+                    help="回答后询问是否提取完整语义层（base全量+CLIP，后续问题秒答）")
+    ap.add_argument("--layer", action="store_true", help="直接提取完整语义层（不询问）")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -212,9 +249,9 @@ def main():
         video_path, title = download(args.target, args.workdir)
     print(f"🎬 {os.path.basename(video_path)}" + (f"（{title}）" if title else ""), flush=True)
 
-    # 2. tiny ASR 全文索引
+    # 2. tiny ASR 全文索引（带缓存：同一视频二次提问跳过提取）
     print("🔍 tiny ASR 全文索引...", flush=True)
-    avis_dir = encode(video_path, args.workdir, "tiny", "avis_tiny")
+    avis_dir, _vh = encode_cached(video_path, args.workdir, "tiny")
     dur = float(run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                      "-show_entries", "stream=duration", "-of", "csv=p=0", video_path]).stdout.strip() or 0)
 
@@ -293,12 +330,36 @@ def main():
     info_tok = asr_tok + n_tracks * 60 + 150
     orig_tok = int(dur * 30 * 1000)
 
+    # 4b. 懒加载语义层：问用户要不要建完整层（base 全量 + CLIP 视觉索引）
+    has_tiny, has_full = layer_cache_status(video_path, args.workdir)
+    layer_built = has_full
+    if args.layer or args.ask_layer:
+        if not has_full:
+            if args.layer or (not args.json):
+                if args.layer:
+                    resp = "y"
+                else:
+                    print("\n💡 建议：提取完整语义层（base 全量转写 + CLIP 视觉索引，约 2-4min）——"
+                          "之后问这个视频任何问题都秒答、更准。")
+                    resp = input("要提取吗？(y/N): ").strip().lower()
+                if resp in ("y", "yes"):
+                    t1 = time.time()
+                    base_dir, _ = encode_cached(video_path, args.workdir, "base", use_clip=True)
+                    layer_built = True
+                    print(f"✅ 完整语义层已建（{time.time() - t1:.0f}s）→ {os.path.dirname(base_dir)}", flush=True)
+                    upgrades.append("layer:base+clip")
+            # json 模式不阻塞：标记 suggest_layer 由 agent 决定
+        elif args.ask_layer:
+            print("♻️  完整语义层已在缓存中，直接复用", flush=True)
+
     result = {
         "video": os.path.basename(video_path), "title": title, "duration_s": round(dur),
         "elapsed_s": round(elapsed), "info_tokens": info_tok, "orig_frame_tokens": orig_tok,
         "token_compression_pct": round(100 * (1 - info_tok / orig_tok), 2),
         "cost_cny": round(total_cost, 5), "visual_cost_cny": round(visual_cost, 5),
         "rounds": rounds, "upgrades": upgrades, "locator_gaps": loc_gaps,
+        "layer_cached": has_full,
+        "suggest_layer": (not has_full) and (not layer_built),
         "answers": [{"question": q, "answer": a} for q, a in zip(qs, answers)],
     }
     if args.json:
