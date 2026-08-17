@@ -230,8 +230,10 @@ img{max-width:100%;border-radius:14px;border:1px solid var(--border)}
       <tr><td><strong>火锅·全量版</strong></td><td>21.5min</td><td>点了哪些荤菜</td><td>tiny→base→base(重复bug)</td><td>799s</td><td>0.0167 元</td><td>⚠️ 需人工补跑</td></tr>
       <tr><td><strong>火锅·问题驱动</strong></td><td>21.5min</td><td>点了哪些荤菜</td><td>定位→base局部→L2菜单特写</td><td><strong>314s</strong></td><td><strong>0.0125 元</strong></td><td>✅ 牛肉/鸡肉/毛肚/老鹅蹄花，零人工</td></tr>
       <tr><td><strong>金谍行动</strong></td><td>150min</td><td>正片从第几分钟开始</td><td>时间类→视觉优先读画面标注</td><td>540s</td><td>0.0098 元</td><td>✅ 60:00（UP标注「正片在01:00:00」，一轮达标 10/10）</td></tr>
+      <tr><td><strong>变蝇人2</strong></td><td>161min</td><td>主角何时变苍蝇人</td><td>文本定位→base局部→L2变异段</td><td>23s*</td><td>0.0159 元</td><td>✅ ~111min 变异段（L2确认「身体变异+精神崩溃」）</td></tr>
     </table>
-    <p class="dim" style="margin-top:10px">⭐ <strong>反侦查 reality</strong>：B站影视类视频常有 UP 主加稀释内容躲避版权审查（前 1 小时"看似剧情"实为填充）——光看画面/语音会误判，<strong>画面文字标注（"正片在XX:XX"）才是权威信号</strong>。已实现：视觉 prompt 强制读取画面文字 + 时间类问题自动视觉优先 + 回答规则"制作者标注优先采信"。</p>
+    <p class="dim" style="margin-top:6px">* 23s 为语义层缓存命中后的重问耗时（首次提取另计）。</p>
+    <p class="dim" style="margin-top:10px">⭐ <strong>反侦查 reality（B站影视普遍现象）</strong>：UP 主加稀释内容躲避版权审查——《金谍行动》前 1 小时"看似剧情"实为填充（标注「正片在01:00:00」）；《变蝇人2》前 6 分钟是《关雎》AI 无关内容。光看画面/语音会误判，<strong>画面文字标注才是权威信号</strong>。已实现：①视觉 prompt 强制读取画面文字标注；②结构时间类问题（正片/片头/广告）自动视觉优先读标注；③剧情事件时间（"什么时候变异"）走 ASR 文本定位——两类时间问题分流，避免误判。</p>
     <div class="tl"><strong>演进：</strong>三个案例逼出「问题驱动定位」——带着问题找答案：LLM 定位器语义定位答案窗口（荤菜→菜单段），只花关键窗口成本（局部 base 重转写 36 段 96s vs 全量 8-10min）。火锅视频从 <strong>799s/需人工 → 314s/零人工</strong>，成本还降 25%。</div>
     <p class="dim">四维评分（问题驱动版）：<strong>速度 8/10（314s）· 准确 9/10 · token 10/10（0.0125 元）· 人工 10/10 = 37/40</strong>。全部案例 token 压缩 99.99%。</p>
   </div>
