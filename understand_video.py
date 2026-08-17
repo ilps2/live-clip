@@ -151,6 +151,12 @@ def asr_coverage(avis_dir):
     segs = load_transcript(avis_dir)
     return sum(len(s.get("text", "")) for s in segs)
 
+TIMING_WORDS = ("正片", "开始", "第几分钟", "起点", "片头", "几点", "时间开始", "从.*分钟", "广告", "预告")
+
+def is_timing_question(question):
+    """识别'正片起点/开始时间'类问题（需视觉读文字标注）。"""
+    return any(re.search(w, question) for w in TIMING_WORDS)
+
 def clip_search(avis_dir, query, top_k=3):
     """调 avis.py search_avis 返回 [(timestamp, score)]。"""
     code = (f"import sys, pathlib; sys.path.insert(0, {os.path.dirname(AVIS)!r}); "
@@ -339,7 +345,11 @@ def main():
 
     # 3a. 定位一次，生成聚焦计划
     #     ASR 覆盖极低（纯视觉视频）→ CLIP 视觉检索定位；否则文本定位
-    if asr_coverage(avis_dir) < 60:
+    #     '正片起点'类问题 → 强制视觉优先（读画面文字标注）
+    if is_timing_question(qs[0]):
+        wins, gap, reason = ["0-360"], "visual", "timing问题：需视觉读画面文字标注（正片在XX:XX）"
+        print(f"  [定位] 时间类问题 → 视觉优先 窗口={wins} 缺口=visual（读标注）", flush=True)
+    elif asr_coverage(avis_dir) < 60:
         wins, gap, reason = locate_visual(qs[0], video_path, avis_dir, args.workdir, dur, title)
     else:
         wins, gap, reason = locate(qs[0], avis_dir, dur, title)
@@ -379,7 +389,9 @@ def main():
         if title:
             p = f"# 视频标题：{title}\n（标题可能与内容不符，请结合内容判断）\n\n" + p
         sys_msg = ("你是视频内容分析助手。基于信息层（语音转写+场景结构+运动对象轨迹"
-                   + ("+视觉帧描述" if visual_note else "") + "）回答。直接给答案，不要复述问题。")
+                   + ("+视觉帧描述" if visual_note else "") + "）回答。直接给答案，不要复述问题。"
+                   "⭐重要规则：视觉描述中的画面文字标注（如'正片在XX:XX'、时间水印）是制作者给出的权威信息，"
+                   "优先采信为答案，不要当作装饰水印忽略。")
         print(f"🤖 回答（第 {rounds + 1} 轮）...", flush=True)
         msg, usage = llm([{"role": "system", "content": sys_msg},
                           {"role": "user", "content": p + visual_note + "\n\n" + q_block +

@@ -94,14 +94,14 @@ def main():
     l1 = sub.add_parser("l1")
     l1.add_argument("video"); l1.add_argument("avis_dir")
     l1.add_argument("--frames", type=int, default=5)
-    l1.add_argument("--question", default="描述这些画面：有什么人/物、在做什么、什么颜色/姿态/衣着、场景如何？按帧顺序说明。")
+    l1.add_argument("--question", default="描述这些画面：有什么人/物、在做什么、什么颜色/姿态/衣着、场景如何？按帧顺序说明。\n\n⭐重要：优先读取画面中的文字/字幕/水印标注——它们可能是关键信息（如\"正片在XX:XX\"、价格、名称、警告语）。单独列出每帧出现的文字内容。")
     l1.add_argument("--json", action="store_true")
 
     l2 = sub.add_parser("l2")
     l2.add_argument("video"); l2.add_argument("avis_dir")
     l2.add_argument("--window", default="auto")
     l2.add_argument("--step", type=int, default=2)
-    l2.add_argument("--question", default="按时间顺序描述这些帧：每帧发生了什么、对象/动作/变化。这是同一段视频按时间采样的帧。")
+    l2.add_argument("--question", default="按时间顺序描述这些帧：每帧发生了什么、对象/动作/变化。这是同一段视频按时间采样的帧。\n\n⭐重要：优先读取画面中的文字/字幕/水印标注——它们可能是关键信息（如\"正片在XX:XX\"、价格、名称、警告语）。单独列出每帧出现的文字内容，特别是时间格式的标注。")
     l2.add_argument("--json", action="store_true")
 
     args = ap.parse_args()
