@@ -146,6 +146,81 @@ def locate(question, avis_dir, dur, title=""):
     print(f"  [定位] 窗口={wins} 缺口={gap} 原因={d.get('reason', '')}", flush=True)
     return wins, gap, d.get("reason", "")
 
+def asr_coverage(avis_dir):
+    """ASR 覆盖度：返回转写总字数（纯视觉视频≈0）。"""
+    segs = load_transcript(avis_dir)
+    return sum(len(s.get("text", "")) for s in segs)
+
+def clip_search(avis_dir, query, top_k=3):
+    """调 avis.py search_avis 返回 [(timestamp, score)]。"""
+    code = (f"import sys, pathlib; sys.path.insert(0, {os.path.dirname(AVIS)!r}); "
+            f"from avis import search_avis; "
+            f"print(repr(search_avis(pathlib.Path({str(avis_dir)!r}), {query!r}, {top_k})))")
+    r = run([PY, "-c", code], timeout=180)
+    for line in reversed(r.stdout.strip().splitlines()):
+        if line.startswith("["):
+            try:
+                return eval(line)
+            except Exception:
+                continue
+    print(f"  ⚠️ CLIP search 解析失败: {r.stdout[-150:]}")
+    return []
+
+def locate_visual(question, video_path, avis_dir, workdir, dur, title=""):
+    """纯视觉视频定位：问题 → CLIP 视觉查询词 → 检索帧 → 窗口。返回 (windows, gap, reason)。"""
+    print("  [纯视觉] ASR 覆盖≈0，启用 CLIP 视觉检索定位...", flush=True)
+    # 1. 确保 clip 层存在（没有则构建）
+    clip_path = os.path.join(avis_dir, "clip.npz")
+    if not os.path.exists(clip_path):
+        print("  ⚠️ 缺 CLIP 层，构建中（--clip，约 1-3min）...", flush=True)
+        avis_dir2, _ = encode_cached(video_path, workdir, "tiny", use_clip=True)
+        avis_dir = avis_dir2
+    # 2. LLM 提取英文视觉查询词
+    body = {"model": "deepseek-chat",
+            "messages": [{"role": "system", "content": "你是视觉检索词提取器。把用户问题转成 2-3 个英文视觉关键词"
+                          "（CLIP 语义检索用，覆盖主要视觉元素/动作/场景）。只输出 JSON 数组。"},
+                         {"role": "user", "content": f"视频标题: {title or '未知'}\n用户问题: {question}\n"
+                          "输出: [\"keyword1\", \"keyword2\", \"keyword3\"]"}],
+            "max_tokens": 80, "temperature": 0}
+    req = urllib.request.Request(URL, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {KEY}"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        r = json.loads(resp.read())
+    try:
+        queries = parse_json_obj(r["choices"][0]["message"]["content"])
+        if isinstance(queries, dict):
+            queries = list(queries.values())
+        queries = [q for q in (queries or []) if isinstance(q, str) and q.strip()][:3]
+    except Exception:
+        queries = []
+    if not queries:
+        queries = ["person", "action", "sports"]
+    print(f"  [检索词] {queries}", flush=True)
+    # 3. CLIP 检索
+    hits = []
+    for q in queries[:3]:
+        for ts, sc in clip_search(avis_dir, q, 3):
+            hits.append((ts, sc, q))
+    if not hits:
+        return [], "visual", "CLIP 无命中"
+    # 4. 聚合窗口：命中帧 ±12s，相邻合并
+    hits.sort()
+    windows = []
+    cur_a = cur_b = None
+    for ts, _, _ in hits:
+        a, b = max(0, ts - 12), ts + 12
+        if cur_a is None or a > cur_b:
+            windows.append([cur_a, cur_b]) if cur_a is not None else None
+            cur_a, cur_b = a, b
+        else:
+            cur_b = max(cur_b, b)
+    if cur_a is not None:
+        windows.append([cur_a, cur_b])
+    wins = [f"{int(a)}-{int(min(b, dur))}" for a, b in windows[:2]]
+    reason = f"CLIP 命中 {len(hits)} 帧: {[(int(t), q) for t, s, q in hits[:4]]}"
+    print(f"  [定位] 纯视觉窗口={wins} 缺口=visual 原因={reason}", flush=True)
+    return wins, "visual", reason
+
 def retranscribe_window(video_path, avis_dir, window, model="base"):
     """局部重转写：裁音频 → base 转写 → 时间戳偏移 → 替换 transcript 对应段。返回 (新段数, 耗时)。"""
     a, b = (int(x) for x in window.split("-"))
@@ -263,17 +338,24 @@ def main():
     loc_gaps = []
 
     # 3a. 定位一次，生成聚焦计划
-    wins, gap, reason = locate(qs[0], avis_dir, dur, title)
+    #     ASR 覆盖极低（纯视觉视频）→ CLIP 视觉检索定位；否则文本定位
+    if asr_coverage(avis_dir) < 60:
+        wins, gap, reason = locate_visual(qs[0], video_path, avis_dir, args.workdir, dur, title)
+    else:
+        wins, gap, reason = locate(qs[0], avis_dir, dur, title)
     loc_gaps.append(gap)
     if not wins:
         wins = [f"0-{min(60, int(dur))}"]
     # 计划：按缺口优先排列（base 后补 visual，因为 base 可能仍不够；visual 后视情况）
     focus_plan = []
+    is_pure_visual = asr_coverage(avis_dir) < 60
     if gap != "none":
         for w in wins:
             if gap == "asr":
                 focus_plan.append(("base", w))
                 focus_plan.append(("visual", w))   # base 后补视觉（菜单/实物常在画面）
+            elif is_pure_visual:
+                focus_plan.append(("visual", w))   # 纯视觉视频无音频，只排视觉
             else:
                 focus_plan.append(("visual", w))
                 focus_plan.append(("base", w))
