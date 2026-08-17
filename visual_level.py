@@ -14,7 +14,13 @@ L2 时间窗证据：对指定片段密集抽帧 → 时间线证据链（"第X�
 成本: qwen3-vl-flash ≈ 253 tok/帧(图) → L1 单次 ≈ 0.001 元
 """
 import argparse, base64, json, os, subprocess, sys, urllib.request
-
+import os
+import os
+import ssl
+# 系统代理(Clash MITM)用自签名证书 → 指向 macOS 系统证书链（双保险）
+if os.path.exists("/etc/ssl/cert.pem"):
+    os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/cert.pem")
+    ssl._create_default_https_context = lambda: ssl.create_default_context(cafile="/etc/ssl/cert.pem")
 DASHSCOPE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 API_KEY = os.environ.get("DASHSCOPE_API_KEY", "sk-ws-H.EEHLMDY.cFCP.MEUCIDaY1vqigxn4Ku1bA5bbwriTmuQJGQnQEeUkFGvP2oHgAiEAj-fr7MCa51tAN3tyrNcHSkktVJTOSWAjN_-SgVNETIg")
 MODEL = os.environ.get("VLM_MODEL", "qwen3-vl-flash")

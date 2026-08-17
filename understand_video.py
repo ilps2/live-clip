@@ -11,7 +11,12 @@
 成本: ~0.01 元/视频（信息层 1k-3k tok vs 原始逐帧 540万-3800万 tok）
 """
 import argparse, glob, json, os, re, subprocess, sys, time, urllib.request
-
+import os
+import ssl
+# 系统代理(Clash MITM)用自签名证书 → 指向 macOS 系统证书链（双保险）
+if os.path.exists("/etc/ssl/cert.pem"):
+    os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/cert.pem")
+    ssl._create_default_https_context = lambda: ssl.create_default_context(cafile="/etc/ssl/cert.pem")
 PY = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3"
 BILI = os.path.expanduser("~/.agents/skills/bilibili-downloader/scripts/bili_download.py")
 AVIS = os.path.expanduser("~/Desktop/live-clip-repo/avis.py")
@@ -151,10 +156,13 @@ def asr_coverage(avis_dir):
     segs = load_transcript(avis_dir)
     return sum(len(s.get("text", "")) for s in segs)
 
-TIMING_WORDS = ("正片", "开始", "第几分钟", "起点", "片头", "几点", "时间开始", "从.*分钟", "广告", "预告")
+TIMING_WORDS = ("正片", "片头", "广告", "预告", "几点开始", "正片开始", "从.*分钟开始")
+# 注意：宽泛的"什么时候/第几分钟"是剧情事件定位（如"主角什么时候变异"），
+# 应走 ASR 文本定位找事件关键词，而不是视觉读标注。
 
 def is_timing_question(question):
-    """识别'正片起点/开始时间'类问题（需视觉读文字标注）。"""
+    """识别'正片起点/片头多长'类视频结构时间问题（需视觉读画面标注）。
+    剧情事件时间（"什么时候变成X"）不算——走文本定位。"""
     return any(re.search(w, question) for w in TIMING_WORDS)
 
 def clip_search(avis_dir, query, top_k=3):
